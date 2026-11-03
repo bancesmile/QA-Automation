@@ -9,11 +9,11 @@ on:
         required: true
         type: string
       solution_path:
-        description: "Solucion (opcional)"
+        description: "Solucion .sln/.slnx (opcional)"
         required: false
         type: string
       project_path:
-        description: "Proyecto principal (opcional)"
+        description: "Proyecto .csproj (opcional)"
         required: false
         type: string
       tests_path:
@@ -62,7 +62,13 @@ jobs:
   qa-nivel1:
     name: QA Nivel 1 - Analisis General
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
+
+    env:
+      DOTNET_ENVIRONMENT: Testing
+      ASPNETCORE_ENVIRONMENT: Testing
+      CI: "true"
+      DOTNET_NOLOGO: "true"
 
     steps:
       - name: Validar parametros
@@ -72,19 +78,15 @@ jobs:
           QA_MODE: ${{ inputs.qa_mode || 'baseline' }}
         run: |
           set -euo pipefail
-
           if [[ ! "$TARGET" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]; then
-            echo "::error::Usa usuario/repositorio"
+            echo "::error::Formato usuario/repositorio requerido"
             exit 1
           fi
-
-          if [[ "$QA_MODE" != "baseline" && "$QA_MODE" != "strict" ]]; then
+          if [[ "$QA_MODE" != "baseline" &&
+                "$QA_MODE" != "strict" ]]; then
             echo "::error::Modo QA invalido"
             exit 1
           fi
-
-          echo "Repositorio: $TARGET"
-          echo "Modo: $QA_MODE"
 
       - name: Descargar repositorio
         uses: actions/checkout@v7
@@ -103,10 +105,10 @@ jobs:
             9.0.x
             10.0.x
 
-      - name: N1-01 Detectar estructura
+      - name: N1-01 Detectar estructura y perfil
         id: structure
-        shell: bash
         working-directory: proyecto
+        shell: bash
         env:
           SOLUTION: ${{ inputs.solution_path }}
           PROJECT: ${{ inputs.project_path }}
@@ -117,6 +119,7 @@ jobs:
           import re
           import json
           import sys
+          import xml.etree.ElementTree as ET
           from pathlib import Path
 
           ignored = {
@@ -124,12 +127,12 @@ jobs:
               ".vs", ".idea", "packages"
           }
 
-          def files(suffixes):
+          def find_files(extensions):
               return sorted(
                   str(p)
                   for p in Path(".").rglob("*")
                   if p.is_file()
-                  and p.suffix.lower() in suffixes
+                  and p.suffix.lower() in extensions
                   and not any(x in ignored for x in p.parts)
               )
 
@@ -137,54 +140,82 @@ jobs:
               print(f"::error::{message}")
               sys.exit(1)
 
-          def valid_file(value, suffixes):
-              p = Path(value)
-              if not p.is_file() or p.suffix.lower() not in suffixes:
-                  fail(f"Ruta inexistente o invalida: {value}")
+          def validate(path, extensions):
+              p = Path(path)
+              if not p.is_file() or p.suffix.lower() not in extensions:
+                  fail(f"Archivo invalido: {path}")
               return str(p)
 
-          solutions = files({".sln", ".slnx"})
-          projects = files({".csproj"})
-          sources = files({".cs"})
+          solutions = find_files({".sln", ".slnx"})
+          projects = find_files({".csproj"})
+          sources = find_files({".cs"})
 
-          solution = os.environ.get("SOLUTION", "").strip()
-          project = os.environ.get("PROJECT", "").strip()
-          tests_input = os.environ.get("TESTS", "").strip()
+          solution = os.getenv("SOLUTION", "").strip()
+          project = os.getenv("PROJECT", "").strip()
+          tests_input = os.getenv("TESTS", "").strip()
 
           if solution:
-              solution = valid_file(solution, {".sln", ".slnx"})
+              solution = validate(solution, {".sln", ".slnx"})
           elif len(solutions) == 1:
               solution = solutions[0]
           elif len(solutions) > 1:
-              fail("Hay varias soluciones. Indica solution_path.")
+              fail("Varias soluciones: indica solution_path")
 
           test_projects = []
+          profiles = {}
 
-          for p in projects:
-              text = Path(p).read_text(
+          for path in projects:
+              content = Path(path).read_text(
                   encoding="utf-8", errors="replace"
               )
 
-              name_test = re.search(
-                  r"(tests?|specs?)\.csproj$",
-                  Path(p).name,
-                  re.IGNORECASE
-              )
+              try:
+                  root = ET.fromstring(content)
+              except ET.ParseError:
+                  fail(f"XML invalido en {path}")
 
-              package_test = re.search(
+              sdk = (
+                  root.attrib.get("Sdk", "") +
+                  " " +
+                  content
+              ).lower()
+
+              output = ""
+              for node in root.iter():
+                  tag = node.tag.split("}")[-1]
+                  if tag == "OutputType" and node.text:
+                      output = node.text.strip().lower()
+                      break
+
+              test_name = bool(re.search(
+                  r"(tests?|specs?)\.csproj$",
+                  Path(path).name, re.IGNORECASE
+              ))
+
+              test_marker = bool(re.search(
                   r"IsTestProject|Microsoft\.NET\.Test\.Sdk|"
                   r"xunit|NUnit|MSTest",
-                  text,
-                  re.IGNORECASE
-              )
+                  content, re.IGNORECASE
+              ))
 
-              if name_test or package_test:
-                  test_projects.append(p)
+              if test_name or test_marker:
+                  test_projects.append(path)
+                  continue
+
+              if "microsoft.net.sdk.web" in sdk:
+                  profile = "web"
+              elif "microsoft.net.sdk.worker" in sdk:
+                  profile = "worker"
+              elif output in {"exe", "winexe"}:
+                  profile = "console"
+              else:
+                  profile = "library"
+
+              profiles[path] = profile
 
           if tests_input:
-              selected = valid_file(tests_input, {".csproj"})
-              if selected not in test_projects:
-                  test_projects.append(selected)
+              selected = validate(tests_input, {".csproj"})
+              test_projects.append(selected)
 
           test_projects = sorted(set(test_projects))
 
@@ -193,32 +224,42 @@ jobs:
           ]
 
           if project:
-              project = valid_file(project, {".csproj"})
+              project = validate(project, {".csproj"})
+              if project in test_projects:
+                  fail("El proyecto principal es de pruebas")
           elif len(main_projects) == 1:
               project = main_projects[0]
-          elif not solution and len(main_projects) > 1:
-              fail("Hay varios proyectos principales. Indica project_path.")
 
           if projects:
               mode = "dotnet"
               target = solution or project
 
               if not target:
-                  fail("No se pudo seleccionar solucion o proyecto")
+                  fail("Indica solution_path o project_path")
+
+              if project:
+                  profile = profiles.get(project, "dotnet")
+              elif len(set(profiles.values())) == 1:
+                  profile = next(iter(profiles.values()))
+              else:
+                  profile = "multiple"
+
           elif sources:
               mode = "source"
               target = ""
+              profile = "source"
           else:
-              fail("No se encontraron archivos C# o proyectos .NET")
+              fail("No se detecto codigo C#")
 
           config = {
               "mode": mode,
               "target": target,
               "solution": solution,
               "project": project,
+              "profile": profile,
               "tests": test_projects,
-              "source_count": len(sources),
-              "project_count": len(projects)
+              "project_count": len(projects),
+              "source_count": len(sources)
           }
 
           Path(".qa-config.json").write_text(
@@ -228,13 +269,15 @@ jobs:
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"mode={mode}\n")
-              f.write(f"has_tests={str(bool(test_projects)).lower()}\n")
+              f.write(f"profile={profile}\n")
+              f.write(
+                  f"has_tests={str(bool(test_projects)).lower()}\n"
+              )
 
           print("N1-01 APROBADO")
-          print("Modo:", mode)
-          print("Objetivo:", target or "Archivos C#")
+          print("Perfil:", profile)
+          print("Objetivo:", target or "Codigo C#")
           print("Proyectos:", len(projects))
-          print("Archivos C#:", len(sources))
           print("Proyectos de pruebas:", len(test_projects))
           PY
 
@@ -248,10 +291,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           target=$(python3 -c \
             'import json; print(json.load(open(".qa-config.json"))["target"])')
-
           dotnet restore "$target" --verbosity minimal
 
       - name: N1-03 Verificar formato
@@ -266,45 +307,46 @@ jobs:
         run: |
           set -euo pipefail
 
-          mode=$(python3 -c \
-            'import json; print(json.load(open(".qa-config.json"))["mode"])')
-
-          if [[ "$mode" == "dotnet" ]]; then
-            target=$(python3 -c \
-              'import json; print(json.load(open(".qa-config.json"))["target"])')
-
-            dotnet format "$target" \
-              --verify-no-changes \
-              --no-restore
-          else
-            python3 - <<'PY'
+          python3 - <<'PY'
+          import json
+          import subprocess
           import sys
           from pathlib import Path
 
-          errors = []
+          config = json.loads(
+              Path(".qa-config.json").read_text()
+          )
+
+          if config["mode"] == "dotnet":
+              command = [
+                  "dotnet", "format", config["target"],
+                  "--verify-no-changes", "--no-restore"
+              ]
+              sys.exit(subprocess.run(command).returncode)
+
+          issues = []
 
           for path in Path(".").rglob("*.cs"):
-              if any(x in {"bin", "obj", ".git"} for x in path.parts):
+              if any(x in {".git", "bin", "obj"} for x in path.parts):
                   continue
 
-              for n, line in enumerate(
-                  path.read_text(
-                      encoding="utf-8",
-                      errors="replace"
-                  ).splitlines(), 1
-              ):
+              lines = path.read_text(
+                  encoding="utf-8",
+                  errors="replace"
+              ).splitlines()
+
+              for number, line in enumerate(lines, 1):
                   if line.rstrip() != line:
-                      errors.append(f"{path}:{n}: espacios finales")
+                      issues.append(f"{path}:{number}")
 
-          for error in errors[:100]:
-              print(error)
+          for issue in issues[:100]:
+              print("Espacios finales:", issue)
 
-          if errors:
+          if issues:
               sys.exit(1)
 
-          print("Verificacion basica de espacios: APROBADA")
+          print("Verificacion basica APROBADA")
           PY
-          fi
 
       - name: N1-04 Compilar
         id: build
@@ -314,7 +356,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           target=$(python3 -c \
             'import json; print(json.load(open(".qa-config.json"))["target"])')
 
@@ -323,7 +364,7 @@ jobs:
             --no-restore \
             --verbosity normal 2>&1 | tee build.log
 
-      - name: N1-05 Contar advertencias
+      - name: N1-05 Registrar advertencias
         id: warnings
         if: always() && steps.build.outcome == 'success'
         working-directory: proyecto
@@ -334,7 +375,7 @@ jobs:
             build.log || true)
 
           echo "warning_count=$count" >> "$GITHUB_OUTPUT"
-          echo "Coincidencias de advertencias: $count"
+          echo "Advertencias en log: $count"
 
       - name: N1-06 Ejecutar pruebas disponibles
         id: tests
@@ -356,36 +397,32 @@ jobs:
               Path(".qa-config.json").read_text()
           )
 
-          results = Path("TestResults")
-          results.mkdir(exist_ok=True)
+          result_dir = Path("TestResults/N1-06")
+          result_dir.mkdir(parents=True, exist_ok=True)
 
           failed = False
-          total_executed = 0
+          total = 0
 
           for index, project in enumerate(config["tests"], 1):
-              print(f"Ejecutando: {project}", flush=True)
-
-              directory = results / f"test_{index}"
-              directory.mkdir(exist_ok=True)
+              destination = result_dir / str(index)
+              destination.mkdir(parents=True, exist_ok=True)
 
               command = [
                   "dotnet", "test", project,
                   "--configuration", "Release",
                   "--logger", "trx;LogFileName=results.trx",
-                  "--results-directory", str(directory)
+                  "--results-directory", str(destination)
               ]
 
-              result = subprocess.run(command, check=False)
+              run = subprocess.run(command, check=False)
 
-              if result.returncode != 0:
+              if run.returncode != 0:
                   failed = True
 
-              trx_files = list(directory.glob("*.trx"))
+              trx_files = list(destination.glob("*.trx"))
 
               if not trx_files:
-                  print(f"Sin resultados TRX: {project}")
                   failed = True
-                  continue
 
               for trx in trx_files:
                   root = ET.parse(trx).getroot()
@@ -398,22 +435,135 @@ jobs:
                   executed = int(counters.get("executed", "0"))
                   errors = int(counters.get("failed", "0"))
 
-                  total_executed += executed
-
-                  print(
-                      f"Ejecutadas: {executed}, "
-                      f"Fallidas: {errors}"
-                  )
+                  total += executed
 
                   if errors:
                       failed = True
 
-          print("Total ejecutadas:", total_executed)
+          print("Pruebas ejecutadas:", total)
 
-          if failed or total_executed == 0:
+          if failed or total == 0:
               sys.exit(1)
 
           print("N1-06 APROBADO")
+          PY
+
+      - name: N1-07 a N1-11 Pruebas especificas
+        id: functional
+        if: >-
+          steps.build.outcome == 'success' &&
+          steps.structure.outputs.has_tests == 'true'
+        continue-on-error: true
+        working-directory: proyecto
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          config = json.loads(
+              Path(".qa-config.json").read_text()
+          )
+
+          categories = {
+              "N1-07": "QA_Health",
+              "N1-08": "QA_Positive",
+              "N1-09": "QA_Access",
+              "N1-10": "QA_Errors",
+              "N1-11": "QA_Isolation"
+          }
+
+          results = {}
+          failed = False
+          base = Path("TestResults/Funcionales")
+          base.mkdir(parents=True, exist_ok=True)
+
+          for control, category in categories.items():
+              executed_total = 0
+              failed_total = 0
+              execution_error = False
+
+              for index, project in enumerate(
+                  config["tests"], 1
+              ):
+                  destination = base / control / str(index)
+                  destination.mkdir(
+                      parents=True, exist_ok=True
+                  )
+
+                  command = [
+                      "dotnet", "test", project,
+                      "--configuration", "Release",
+                      "--filter", f"Category={category}",
+                      "--logger",
+                      "trx;LogFileName=results.trx",
+                      "--results-directory",
+                      str(destination)
+                  ]
+
+                  run = subprocess.run(
+                      command, check=False
+                  )
+
+                  trx_files = list(
+                      destination.glob("*.trx")
+                  )
+
+                  if run.returncode != 0:
+                      execution_error = True
+
+                  for trx in trx_files:
+                      try:
+                          root = ET.parse(trx).getroot()
+                          counters = root.find(
+                              ".//{*}Counters"
+                          )
+
+                          if counters is None:
+                              execution_error = True
+                              continue
+
+                          executed_total += int(
+                              counters.get("executed", "0")
+                          )
+                          failed_total += int(
+                              counters.get("failed", "0")
+                          )
+                      except Exception as error:
+                          print(error)
+                          execution_error = True
+
+              if failed_total > 0 or execution_error:
+                  status = "FALLIDO"
+                  failed = True
+              elif executed_total == 0:
+                  status = "NO CONFIGURADO"
+              else:
+                  status = "APROBADO"
+
+              results[control] = {
+                  "status": status,
+                  "executed": executed_total,
+                  "failed": failed_total
+              }
+
+              print(
+                  control,
+                  category,
+                  status,
+                  "ejecutadas:", executed_total
+              )
+
+          Path(".qa-functional.json").write_text(
+              json.dumps(results, indent=2),
+              encoding="utf-8"
+          )
+
+          if failed:
+              sys.exit(1)
           PY
 
       - name: Guardar evidencias
@@ -423,109 +573,173 @@ jobs:
           name: evidencias-qa-nivel1
           path: |
             proyecto/build.log
-            proyecto/TestResults/**/*.trx
             proyecto/.qa-config.json
+            proyecto/.qa-functional.json
+            proyecto/TestResults/**/*.trx
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: N1-12 Reporte QA
+      - name: N1-12 Consolidar resultados
         if: always()
         shell: bash
         env:
           STRUCTURE: ${{ steps.structure.outcome }}
           MODE: ${{ steps.structure.outputs.mode }}
+          PROFILE: ${{ steps.structure.outputs.profile }}
           RESTORE: ${{ steps.restore.outcome }}
           FORMAT: ${{ steps.format.outcome }}
           BUILD: ${{ steps.build.outcome }}
           WARNINGS: ${{ steps.warnings.outputs.warning_count }}
           HAS_TESTS: ${{ steps.structure.outputs.has_tests }}
           TESTS: ${{ steps.tests.outcome }}
+          FUNCTIONAL: ${{ steps.functional.outcome }}
           QA_MODE: ${{ inputs.qa_mode || 'baseline' }}
         run: |
           python3 - <<'PY'
           import os
+          import json
           import sys
+          from pathlib import Path
 
           env = os.environ
 
-          def result(name):
-              value = env.get(name, "")
+          def status(key):
+              value = env.get(key, "")
               return {
                   "success": "APROBADO",
                   "failure": "FALLIDO",
                   "skipped": "NO EJECUTADO"
               }.get(value, "NO EVALUADO")
 
-          mode = env.get("MODE", "")
           qa_mode = env.get("QA_MODE", "baseline")
+          mode = env.get("MODE", "")
+          profile = env.get("PROFILE", "")
           has_tests = env.get("HAS_TESTS") == "true"
+
+          functional = {}
+          path = Path("proyecto/.qa-functional.json")
+
+          if path.exists():
+              functional = json.loads(path.read_text())
 
           failed = False
           partial = False
 
-          for key in ["STRUCTURE", "FORMAT"]:
-              if env.get(key) != "success":
-                  failed = True
+          if env.get("STRUCTURE") != "success":
+              failed = True
+
+          if env.get("FORMAT") != "success":
+              failed = True
 
           if mode == "dotnet":
-              for key in ["RESTORE", "BUILD"]:
-                  if env.get(key) != "success":
-                      failed = True
-          else:
+              if env.get("RESTORE") != "success":
+                  failed = True
+              if env.get("BUILD") != "success":
+                  failed = True
+          elif mode == "source":
               partial = True
 
           if has_tests:
-              test_result = result("TESTS")
+              tests = status("TESTS")
               if env.get("TESTS") != "success":
                   failed = True
           else:
-              test_result = "SIN PRUEBAS"
+              tests = "SIN PRUEBAS"
               if qa_mode == "strict":
                   failed = True
+
+          controls = {}
+
+          for number in range(7, 12):
+              code = f"N1-{number:02d}"
+              item = functional.get(code)
+              if item:
+                  controls[code] = item["status"]
+              else:
+                  controls[code] = "NO CONFIGURADO"
+
+              if controls[code] == "FALLIDO":
+                  failed = True
+
+          # No asumir que una biblioteca o consola
+          # tiene un endpoint HTTP.
+          if profile in ("console", "library", "source"):
+              if controls["N1-07"] == "NO CONFIGURADO":
+                  controls["N1-07"] = "NO APLICA"
+
+          # Sin una prueba no se puede afirmar
+          # cumplimiento funcional.
+          if qa_mode == "strict":
+              for code in ["N1-08", "N1-10", "N1-11"]:
+                  if controls[code] != "APROBADO":
+                      failed = True
 
           if failed:
               global_result = "FALLIDO"
           elif partial:
-              global_result = "PARCIAL - SIN COMPILACION"
+              global_result = "PARCIAL"
           else:
               global_result = "APROBADO TECNICO"
 
           rows = [
-              ("N1-01", "Estructura", result("STRUCTURE")),
+              ("N1-01", "Estructura", status("STRUCTURE")),
               ("N1-02", "Dependencias",
-               result("RESTORE") if mode == "dotnet" else "NO EVALUABLE"),
-              ("N1-03", "Formato", result("FORMAT")),
+               status("RESTORE") if mode == "dotnet"
+               else "NO EVALUABLE"),
+              ("N1-03", "Formato", status("FORMAT")),
               ("N1-04", "Compilacion",
-               result("BUILD") if mode == "dotnet" else "NO EVALUABLE"),
+               status("BUILD") if mode == "dotnet"
+               else "NO EVALUABLE"),
               ("N1-05", "Advertencias",
                env.get("WARNINGS") or "NO EVALUADO"),
-              ("N1-06", "Pruebas automaticas", test_result),
-              ("N1-07", "Health Check", "PENDIENTE"),
-              ("N1-08", "Flujo positivo", "PENDIENTE"),
-              ("N1-09", "Acceso", "PENDIENTE"),
-              ("N1-10", "Manejo de errores", "PENDIENTE"),
-              ("N1-11", "Aislamiento externo", "PENDIENTE"),
+              ("N1-06", "Pruebas automaticas", tests),
+              ("N1-07", "Health Check", controls["N1-07"]),
+              ("N1-08", "Flujo positivo", controls["N1-08"]),
+              ("N1-09", "Acceso", controls["N1-09"]),
+              ("N1-10", "Manejo de errores", controls["N1-10"]),
+              ("N1-11", "Aislamiento", controls["N1-11"]),
               ("N1-12", "Resultado tecnico", global_result)
           ]
 
           lines = [
               "## QA Nivel 1 - Reporte",
               "",
-              f"**Modo QA:** {qa_mode}",
-              f"**Tipo detectado:** {mode or 'NO IDENTIFICADO'}",
+              f"**Modo:** {qa_mode}",
+              "",
+              f"**Tipo:** {mode or 'NO IDENTIFICADO'}",
+              "",
+              f"**Perfil:** {profile or 'NO IDENTIFICADO'}",
               "",
               "| ID | Control | Resultado |",
               "|---|---|---|"
           ]
 
           for row in rows:
-              lines.append("| " + " | ".join(row) + " |")
+              lines.append(
+                  "| " + " | ".join(row) + " |"
+              )
+
+          functional_pass = all(
+              value in ("APROBADO", "NO APLICA")
+              for value in controls.values()
+          )
+
+          certification = (
+              "CONTROLES CONFIGURADOS APROBADOS"
+              if functional_pass and not failed
+              else "INCOMPLETA"
+          )
 
           lines.extend([
               "",
-              "**Certificacion funcional completa:** PENDIENTE",
+              "**Certificacion funcional:** " +
+              certification,
               "",
-              "Los controles N1-07 a N1-11 no se han ejecutado."
+              "NO CONFIGURADO significa que no existe "
+              "evidencia de prueba para ese control.",
+              "",
+              "N1-11 requiere verificar que los tests "
+              "utilicen servicios simulados y no produccion."
           ])
 
           with open(env["GITHUB_STEP_SUMMARY"], "a") as f:
