@@ -1,74 +1,31 @@
-
 name: QA - Nivel 1
 
 on:
   workflow_dispatch:
     inputs:
       repository:
-        description: "Repositorio usuario/repositorio"
+        description: "Repositorio (usuario/repositorio)"
         required: true
         type: string
-      solution_path:
-        description: "Solucion opcional"
-        required: false
-        type: string
-      project_path:
-        description: "Proyecto principal opcional"
-        required: false
-        type: string
-      tests_path:
-        description: "Proyecto de pruebas opcional"
-        required: false
-        type: string
-      qa_mode:
-        description: "Politica QA"
-        type: choice
-        default: baseline
-        options:
-          - baseline
-          - strict
-      execution_mode:
-        description: "Tipo de ejecucion"
-        type: choice
-        default: inspection
-        options:
-          - inspection
-          - build_test
-      functional_tests:
-        description: "Ejecutar tests funcionales categorizados"
-        type: boolean
-        default: false
 
   workflow_call:
     inputs:
       repository:
-        type: string
         required: false
+        type: string
         default: ""
-      solution_path:
-        type: string
-        required: false
-        default: ""
-      project_path:
-        type: string
-        required: false
-        default: ""
-      tests_path:
-        type: string
-        required: false
-        default: ""
-      qa_mode:
-        type: string
-        required: false
-        default: baseline
       execution_mode:
+        required: false
         type: string
-        required: false
         default: inspection
-      functional_tests:
-        type: boolean
+      qa_mode:
         required: false
-        default: false
+        type: string
+        default: baseline
+      solution_path:
+        required: false
+        type: string
+        default: ""
     secrets:
       QA_REPO_READ_TOKEN:
         required: false
@@ -81,211 +38,121 @@ jobs:
     name: QA Nivel 1 - Analisis General
     runs-on: ubuntu-24.04
     timeout-minutes: 25
-
     env:
+      REPO_OBJETIVO: ${{ inputs.repository || github.repository }}
+      MODO_EJECUCION: ${{ inputs.execution_mode || 'inspection' }}
+      POLITICA_QA: ${{ inputs.qa_mode || 'baseline' }}
+      SOLUTION_PATH: ${{ inputs.solution_path || '' }}
+      DOTNET_NOLOGO: "true"
       DOTNET_ENVIRONMENT: Testing
       ASPNETCORE_ENVIRONMENT: Testing
       CI: "true"
-      DOTNET_NOLOGO: "true"
 
     steps:
       - name: Validar parametros
+        id: params
         shell: bash
-        env:
-          TARGET: ${{ inputs.repository || github.repository }}
-          QA_MODE: ${{ inputs.qa_mode || 'baseline' }}
-          EXEC_MODE: ${{ inputs.execution_mode || 'inspection' }}
         run: |
           set -euo pipefail
-
-          if [[ ! "$TARGET" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]; then
-            echo "::error::Usa usuario/repositorio"
+          if [[ ! "$REPO_OBJETIVO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Usa usuario/repositorio; no URL ni .git"
             exit 1
           fi
-
-          if [[ "$QA_MODE" != baseline && "$QA_MODE" != strict ]]; then
-            echo "::error::Politica QA invalida"
+          if [[ "$MODO_EJECUCION" != "inspection" && "$MODO_EJECUCION" != "build_test" ]]; then
+            echo "::error::execution_mode invalido"
             exit 1
           fi
-
-          if [[ "$EXEC_MODE" != inspection && "$EXEC_MODE" != build_test ]]; then
-            echo "::error::Modo de ejecucion invalido"
+          if [[ "$POLITICA_QA" != "baseline" && "$POLITICA_QA" != "strict" ]]; then
+            echo "::error::qa_mode invalido"
             exit 1
           fi
+          echo "Repositorio: $REPO_OBJETIVO"
+          echo "Ejecucion: $MODO_EJECUCION"
 
       - name: Descargar repositorio
         id: checkout
         uses: actions/checkout@v7
         with:
           repository: ${{ inputs.repository || github.repository }}
-          ref: ${{ github.event_name == 'workflow_call' && github.sha || '' }}
           token: ${{ secrets.QA_REPO_READ_TOKEN || github.token }}
           path: proyecto
           persist-credentials: false
 
-      - name: N1-01 Detectar estructura
+      - name: N1-01 Detectar estructura y tecnologia
         id: structure
         if: steps.checkout.outcome == 'success'
         working-directory: proyecto
         shell: bash
-        env:
-          SOLUTION: ${{ inputs.solution_path }}
-          PROJECT: ${{ inputs.project_path }}
-          TESTS: ${{ inputs.tests_path }}
         run: |
           python3 - <<'PY'
+          import json
           import os
           import re
-          import json
           import sys
           from pathlib import Path
 
-          ignored = {
-              ".git", "bin", "obj", "node_modules",
-              ".vs", ".idea", "packages"
-          }
+          excluded = {'.git', 'bin', 'obj', 'node_modules', '.vs', '.idea', 'packages'}
+          def files(extension):
+              return sorted(str(p) for p in Path('.').rglob('*')
+                            if p.is_file() and p.suffix.lower() in extension
+                            and not excluded.intersection(p.parts))
 
-          def find(ext):
-              return sorted(
-                  str(p) for p in Path(".").rglob("*")
-                  if p.is_file()
-                  and p.suffix.lower() in ext
-                  and not any(x in ignored for x in p.parts)
-              )
-
-          def validate(value, extensions):
-              p = Path(value)
-              if not p.is_file() or p.suffix.lower() not in extensions:
-                  raise ValueError(f"Ruta invalida: {value}")
-              return str(p)
-
-          try:
-              solutions = find({".sln", ".slnx"})
-              projects = find({".csproj"})
-              sources = find({".cs"})
-
-              solution = os.getenv("SOLUTION", "").strip()
-              project = os.getenv("PROJECT", "").strip()
-              tests = os.getenv("TESTS", "").strip()
-
-              if solution:
-                  solution = validate(solution, {".sln", ".slnx"})
-              elif len(solutions) == 1:
-                  solution = solutions[0]
-              elif len(solutions) > 1:
-                  raise ValueError(
-                      "Varias soluciones: indica solution_path"
-                  )
-
-              test_projects = []
-              profiles = {}
-
-              for path in projects:
-                  data = Path(path).read_text(
-                      encoding="utf-8", errors="replace"
-                  )
-
-                  is_test = bool(re.search(
-                      r"(tests?|specs?)\.csproj$|"
-                      r"<IsTestProject>\s*true\s*</IsTestProject>|"
-                      r"Microsoft\.NET\.Test\.Sdk|"
-                      r"xunit|NUnit|MSTest",
-                      Path(path).name + "\n" + data,
-                      re.IGNORECASE
-                  ))
-
-                  if is_test:
-                      test_projects.append(path)
-                      continue
-
-                  lower = data.lower()
-                  if "microsoft.net.sdk.web" in lower:
-                      profile = "web"
-                  elif "microsoft.net.sdk.worker" in lower:
-                      profile = "worker"
-                  elif re.search(
-                      r"<OutputType>\s*(Exe|WinExe)\s*</OutputType>",
-                      data, re.IGNORECASE
-                  ):
-                      profile = "console"
-                  else:
-                      profile = "library"
-
-                  profiles[path] = profile
-
-              if tests:
-                  selected = validate(tests, {".csproj"})
-                  test_projects.append(selected)
-
-              test_projects = sorted(set(test_projects))
-              main_projects = [
-                  p for p in projects if p not in test_projects
-              ]
-
-              if project:
-                  project = validate(project, {".csproj"})
-                  if project in test_projects:
-                      raise ValueError("Proyecto principal es de pruebas")
-              elif len(main_projects) == 1:
-                  project = main_projects[0]
-
-              if projects:
-                  mode = "dotnet"
-                  target = solution or project
-                  if not target:
-                      raise ValueError(
-                          "Varias soluciones/proyectos: especifica ruta"
-                      )
-              elif sources:
-                  mode = "source"
-                  target = ""
+          solutions = files({'.sln', '.slnx'})
+          projects = files({'.csproj'})
+          sources = files({'.cs'})
+          test_projects = []
+          profiles = {}
+          for path in projects:
+              xml = Path(path).read_text(encoding='utf-8', errors='replace')
+              name = Path(path).stem
+              is_test = (bool(re.search(r'(?i)(test|tests|spec|specs)$', name)) or
+                         bool(re.search(r'(?i)<IsTestProject>\s*true\s*</IsTestProject>|Microsoft\.NET\.Test\.Sdk|<PackageReference\s+Include="(?:xunit|nunit|mstest)', xml)))
+              if is_test:
+                  test_projects.append(path)
+                  continue
+              if re.search(r'(?i)Microsoft\.NET\.Sdk\.Web', xml):
+                  profiles[path] = 'web'
+              elif re.search(r'(?i)Microsoft\.NET\.Sdk\.Worker', xml):
+                  profiles[path] = 'worker'
+              elif re.search(r'(?i)<OutputType>\s*(Exe|WinExe)\s*</OutputType>', xml):
+                  profiles[path] = 'console'
               else:
-                  raise ValueError("No se encontro codigo C#")
+                  profiles[path] = 'library'
 
-              if mode == "source":
-                  profile = "source"
-              elif project:
-                  profile = profiles.get(project, "multiple")
-              elif len(set(profiles.values())) == 1:
-                  profile = next(iter(profiles.values()))
-              else:
-                  profile = "multiple"
+          requested = os.environ.get('SOLUTION_PATH', '').strip()
+          if requested and (not Path(requested).is_file() or Path(requested).suffix.lower() not in {'.sln', '.slnx'}):
+              print('::error::solution_path no existe o no es .sln/.slnx')
+              sys.exit(1)
 
-              config = {
-                  "mode": mode,
-                  "profile": profile,
-                  "target": target,
-                  "tests": test_projects,
-                  "projects": projects,
-                  "sources": len(sources)
-              }
+          main = [p for p in projects if p not in test_projects]
+          target = requested or (solutions[0] if len(solutions) == 1 else
+                                 main[0] if len(solutions) == 0 and len(main) == 1 else '')
+          if projects:
+              kind = 'dotnet'
+          elif sources:
+              kind = 'source'
+          else:
+              kind = 'unsupported'
 
-              Path(".qa-config.json").write_text(
-                  json.dumps(config, indent=2),
-                  encoding="utf-8"
-              )
-
-              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-                  f.write(f"mode={mode}\n")
-                  f.write(f"profile={profile}\n")
-                  f.write(
-                      f"has_tests={str(bool(test_projects)).lower()}\n"
-                  )
-
-              print("N1-01 APROBADO")
-              print("Tipo:", mode)
-              print("Perfil:", profile)
-              print("Objetivo:", target or "Codigo C#")
-              print("Proyectos:", len(projects))
-              print("Tests:", len(test_projects))
-
-          except Exception as ex:
-              print(f"::error::{ex}")
+          profile = (next(iter(set(profiles.values()))) if len(set(profiles.values())) == 1
+                     else 'multiple' if profiles else 'source' if sources else 'unknown')
+          config = dict(kind=kind, profile=profile, target=target,
+                        solutions=solutions, projects=projects,
+                        test_projects=test_projects, source_count=len(sources))
+          Path('.qa-config.json').write_text(json.dumps(config, indent=2), encoding='utf-8')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'kind={kind}\n')
+              output.write(f'profile={profile}\n')
+              output.write(f'has_tests={str(bool(test_projects)).lower()}\n')
+              output.write(f'has_target={str(bool(target)).lower()}\n')
+          print(json.dumps(config, indent=2))
+          if kind == 'unsupported':
+              print('::error::Repositorio sin codigo C# o proyecto .NET')
               sys.exit(1)
           PY
 
-      - name: N1-07 a N1-11 Inspeccion general
-        id: generic
+      - name: N1-07 a N1-11 Inspeccion estatica generica
+        id: inspection
         if: steps.structure.outcome == 'success'
         working-directory: proyecto
         shell: bash
@@ -295,104 +162,36 @@ jobs:
           import re
           from pathlib import Path
 
-          config = json.loads(
-              Path(".qa-config.json").read_text()
-          )
-
-          ignored = {
-              ".git", "bin", "obj", "node_modules",
-              ".vs", ".idea"
-          }
-
-          sources = []
-          for p in Path(".").rglob("*.cs"):
-              if not p.is_file():
-                  continue
-              if any(part in ignored for part in p.parts):
-                  continue
-              sources.append(p)
-
+          config = json.loads(Path('.qa-config.json').read_text(encoding='utf-8'))
+          excluded = {'.git', 'bin', 'obj', 'node_modules', '.vs', '.idea', 'packages'}
           patterns = {
-              "N1-07": [
-                  r"\bMapHealthChecks\s*\(",
-                  r"\bUseHealthChecks\s*\(",
-                  r'\bMapGet\s*\(\s*"/health[^"]*"'
-              ],
-              "N1-08": [
-                  r"\bMap(Get|Post|Put|Delete|Patch)\s*\(",
-                  r"\[Http(Get|Post|Put|Delete|Patch)",
-                  r"\bIRequestHandler\s*<"
-              ],
-              "N1-09": [
-                  r"\[Authorize\b",
-                  r"\bRequireAuthorization\s*\(",
-                  r"\bAddAuthentication\s*\(",
-                  r"\bAddAuthorization\s*\("
-              ],
-              "N1-10": [
-                  r"\bUseExceptionHandler\s*\(",
-                  r"\bAddProblemDetails\s*\(",
-                  r"\bIExceptionHandler\b",
-                  r"\bcatch\s*\("
-              ],
-              "N1-11": [
-                  r"\bMoq\b",
-                  r"\bNSubstitute\b",
-                  r"\bFakeItEasy\b",
-                  r"\bWireMock\b",
-                  r"\bTestcontainers\b",
-                  r"\bUseInMemoryDatabase\s*\("
-              ]
+              'N1-07': [r'\bMapHealthChecks\s*\(', r'\bUseHealthChecks\s*\(', r'\bIHealthCheck\b', r'\bAddHealthChecks\s*\('],
+              'N1-08': [r'\bMap(?:Get|Post|Put|Delete|Patch)\s*\(', r'\[Http(?:Get|Post|Put|Delete|Patch)', r'\bIRequestHandler\b', r'\bControllerBase\b'],
+              'N1-09': [r'\[Authorize\b', r'\bRequireAuthorization\s*\(', r'\bAddAuthentication\s*\(', r'\bAddAuthorization\s*\(', r'\bJwtBearerDefaults\b'],
+              'N1-10': [r'\bUseExceptionHandler\s*\(', r'\bAddProblemDetails\s*\(', r'\bIExceptionHandler\b', r'\bcatch\s*\('],
+              'N1-11': [r'\bMoq\b', r'\bNSubstitute\b', r'\bFakeItEasy\b', r'\bWireMock\b', r'\bTestcontainers\b', r'\bUseInMemoryDatabase\s*\(']
           }
-
+          evidence = {key: [] for key in patterns}
+          paths = sorted(p for p in Path('.').rglob('*.cs')
+                         if p.is_file() and not excluded.intersection(p.parts))
+          for path in paths:
+              for number, line in enumerate(path.read_text(encoding='utf-8', errors='replace').splitlines(), 1):
+                  for key, expressions in patterns.items():
+                      if any(re.search(expr, line, re.IGNORECASE) for expr in expressions):
+                          evidence[key].append({'archivo': str(path), 'linea': number})
           results = {}
-
-          for control, expressions in patterns.items():
-              evidence = []
-
-              for file in sources:
-                  text = file.read_text(
-                      encoding="utf-8", errors="replace"
-                  )
-
-                  for expr in expressions:
-                      if re.search(expr, text, re.IGNORECASE):
-                          evidence.append(str(file))
-                          break
-
-              evidence = sorted(set(evidence))
-
-              if (
-                  control == "N1-07"
-                  and config["profile"] in ("console", "library", "source")
-              ):
-                  status = "NO APLICA"
-              elif evidence:
-                  status = "EVIDENCIA ESTATICA"
-              else:
-                  status = "SIN EVIDENCIA"
-
-              results[control] = {
-                  "status": status,
-                  "files": evidence[:25],
-                  "count": len(evidence)
-              }
-
-              print(
-                  control, status,
-                  "Archivos:", len(evidence)
-              )
-
-          Path(".qa-generic.json").write_text(
-              json.dumps(results, indent=2),
-              encoding="utf-8"
-          )
+          for key, matches in evidence.items():
+              status = 'EVIDENCIA ESTATICA' if matches else 'SIN EVIDENCIA'
+              results[key] = {'estado': status, 'coincidencias': len(matches), 'ubicaciones': matches[:30]}
+              print(f'{key}: {status} ({len(matches)} coincidencias)')
+          Path('.qa-inspection.json').write_text(json.dumps(results, indent=2), encoding='utf-8')
           PY
 
-      - name: Instalar .NET SDK
+      - name: Instalar SDK .NET (solo build_test)
         if: >-
-          inputs.execution_mode == 'build_test' &&
-          steps.structure.outputs.mode == 'dotnet'
+          env.MODO_EJECUCION == 'build_test' &&
+          steps.structure.outputs.kind == 'dotnet' &&
+          steps.structure.outputs.has_target == 'true'
         uses: actions/setup-dotnet@v6
         with:
           dotnet-version: |
@@ -403,51 +202,38 @@ jobs:
       - name: N1-02 Restaurar dependencias
         id: restore
         if: >-
-          inputs.execution_mode == 'build_test' &&
-          steps.structure.outcome == 'success' &&
-          steps.structure.outputs.mode == 'dotnet'
+          env.MODO_EJECUCION == 'build_test' &&
+          steps.structure.outputs.kind == 'dotnet' &&
+          steps.structure.outputs.has_target == 'true'
         continue-on-error: true
         working-directory: proyecto
         shell: bash
         run: |
           set -euo pipefail
-          target=$(python3 -c \
-            'import json; print(json.load(open(".qa-config.json"))["target"])')
+          target=$(python3 -c 'import json;print(json.load(open(".qa-config.json"))["target"])')
           dotnet restore "$target" --verbosity minimal
 
       - name: N1-03 Verificar formato
         id: format
-        if: >-
-          inputs.execution_mode == 'build_test' &&
-          steps.restore.outcome == 'success'
+        if: env.MODO_EJECUCION == 'build_test' && steps.restore.outcome == 'success'
         continue-on-error: true
         working-directory: proyecto
         shell: bash
         run: |
           set -euo pipefail
-          target=$(python3 -c \
-            'import json; print(json.load(open(".qa-config.json"))["target"])')
-          dotnet format "$target" \
-            --verify-no-changes \
-            --no-restore \
-            --verbosity normal 2>&1 | tee format.log
+          target=$(python3 -c 'import json;print(json.load(open(".qa-config.json"))["target"])')
+          dotnet format "$target" --verify-no-changes --no-restore --verbosity normal 2>&1 | tee format.log
 
       - name: N1-04 Compilar
         id: build
-        if: >-
-          inputs.execution_mode == 'build_test' &&
-          steps.restore.outcome == 'success'
+        if: env.MODO_EJECUCION == 'build_test' && steps.restore.outcome == 'success'
         continue-on-error: true
         working-directory: proyecto
         shell: bash
         run: |
           set -euo pipefail
-          target=$(python3 -c \
-            'import json; print(json.load(open(".qa-config.json"))["target"])')
-          dotnet build "$target" \
-            --configuration Release \
-            --no-restore \
-            --verbosity normal 2>&1 | tee build.log
+          target=$(python3 -c 'import json;print(json.load(open(".qa-config.json"))["target"])')
+          dotnet build "$target" --configuration Release --no-restore --verbosity normal 2>&1 | tee build.log
 
       - name: N1-05 Registrar advertencias
         id: warnings
@@ -455,16 +241,14 @@ jobs:
         working-directory: proyecto
         shell: bash
         run: |
-          count=$(grep -Eic \
-            ':[[:space:]]warning[[:space:]]' \
-            build.log || true)
+          count=$(grep -Eic ':[[:space:]]warning[[:space:]]' build.log || true)
           echo "count=$count" >> "$GITHUB_OUTPUT"
           echo "Coincidencias de advertencias: $count"
 
-      - name: N1-06 Pruebas automatizadas
+      - name: N1-06 Ejecutar tests existentes
         id: tests
         if: >-
-          inputs.execution_mode == 'build_test' &&
+          env.MODO_EJECUCION == 'build_test' &&
           steps.build.outcome == 'success' &&
           steps.structure.outputs.has_tests == 'true'
         continue-on-error: true
@@ -478,147 +262,44 @@ jobs:
           import xml.etree.ElementTree as ET
           from pathlib import Path
 
-          config = json.loads(
-              Path(".qa-config.json").read_text()
-          )
-
-          total = 0
+          projects = json.loads(Path('.qa-config.json').read_text())['test_projects']
+          executed = 0
           failed = False
-          rootdir = Path("TestResults/N1-06")
-
-          for i, project in enumerate(config["tests"], 1):
-              destination = rootdir / str(i)
+          for number, project in enumerate(projects, 1):
+              destination = Path('TestResults') / str(number)
               destination.mkdir(parents=True, exist_ok=True)
-
-              cmd = [
-                  "dotnet", "test", project,
-                  "--configuration", "Release",
-                  "--logger", "trx;LogFileName=result.trx",
-                  "--results-directory", str(destination)
-              ]
-
-              run = subprocess.run(cmd, check=False)
-              if run.returncode != 0:
+              result = subprocess.run(['dotnet', 'test', project, '--configuration', 'Release',
+                                       '--logger', 'trx;LogFileName=result.trx',
+                                       '--results-directory', str(destination)], check=False)
+              if result.returncode != 0:
                   failed = True
-
-              files = list(destination.glob("*.trx"))
+              files = list(destination.glob('*.trx'))
               if not files:
                   failed = True
-
-              for trx in files:
+              for file in files:
                   try:
-                      root = ET.parse(trx).getroot()
-                      node = root.find(".//{*}Counters")
+                      node = ET.parse(file).getroot().find('.//{*}Counters')
                       if node is None:
                           failed = True
                           continue
-                      total += int(node.get("executed", "0"))
-                      if int(node.get("failed", "0")) > 0:
+                      executed += int(node.get('executed', '0'))
+                      if int(node.get('failed', '0')) > 0:
                           failed = True
-                  except Exception:
+                  except (ET.ParseError, ValueError):
                       failed = True
-
-          print("Pruebas ejecutadas:", total)
-          if failed or total == 0:
+          print(f'Tests ejecutados: {executed}')
+          if failed or executed == 0:
               sys.exit(1)
           PY
 
-      - name: N1-07 a N1-11 Tests funcionales opcionales
-        id: functional
-        if: >-
-          inputs.execution_mode == 'build_test' &&
-          inputs.functional_tests == true &&
-          steps.tests.outcome == 'success'
-        continue-on-error: true
-        working-directory: proyecto
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import json
-          import subprocess
-          import xml.etree.ElementTree as ET
-          from pathlib import Path
-
-          config = json.loads(
-              Path(".qa-config.json").read_text()
-          )
-
-          categories = {
-              "N1-07": "QA_Health",
-              "N1-08": "QA_Positive",
-              "N1-09": "QA_Access",
-              "N1-10": "QA_Errors",
-              "N1-11": "QA_Isolation"
-          }
-
-          results = {}
-          base = Path("TestResults/Funcionales")
-
-          for control, category in categories.items():
-              executed = 0
-              failures = 0
-              errors = False
-
-              for i, project in enumerate(config["tests"], 1):
-                  folder = base / control / str(i)
-                  folder.mkdir(parents=True, exist_ok=True)
-
-                  cmd = [
-                      "dotnet", "test", project,
-                      "--configuration", "Release",
-                      "--filter", f"Category={category}",
-                      "--logger", "trx;LogFileName=result.trx",
-                      "--results-directory", str(folder)
-                  ]
-
-                  run = subprocess.run(cmd, check=False)
-                  trx_files = list(folder.glob("*.trx"))
-
-                  for trx in trx_files:
-                      try:
-                          root = ET.parse(trx).getroot()
-                          node = root.find(".//{*}Counters")
-                          if node is None:
-                              errors = True
-                              continue
-                          executed += int(node.get("executed", "0"))
-                          failures += int(node.get("failed", "0"))
-                      except Exception:
-                          errors = True
-
-                  if run.returncode != 0:
-                      errors = True
-
-              if failures or errors:
-                  status = "FALLIDO"
-              elif executed:
-                  status = "APROBADO"
-              else:
-                  status = "NO CONFIGURADO"
-
-              results[control] = {
-                  "status": status,
-                  "executed": executed,
-                  "failed": failures
-              }
-
-              print(control, status, executed)
-
-          Path(".qa-functional.json").write_text(
-              json.dumps(results, indent=2),
-              encoding="utf-8"
-          )
-          PY
-
       - name: Guardar evidencias
-        if: always()
+        if: always() && steps.checkout.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
           name: evidencias-qa-nivel1
           path: |
             proyecto/.qa-config.json
-            proyecto/.qa-generic.json
-            proyecto/.qa-functional.json
+            proyecto/.qa-inspection.json
             proyecto/format.log
             proyecto/build.log
             proyecto/TestResults/**/*.trx
@@ -629,179 +310,104 @@ jobs:
         if: always()
         shell: bash
         env:
-          REPO: ${{ inputs.repository || github.repository }}
-          EXEC_MODE: ${{ inputs.execution_mode || 'inspection' }}
-          QA_MODE: ${{ inputs.qa_mode || 'baseline' }}
           CHECKOUT: ${{ steps.checkout.outcome }}
           STRUCTURE: ${{ steps.structure.outcome }}
+          INSPECTION: ${{ steps.inspection.outcome }}
+          KIND: ${{ steps.structure.outputs.kind }}
+          HAS_TARGET: ${{ steps.structure.outputs.has_target }}
+          HAS_TESTS: ${{ steps.structure.outputs.has_tests }}
           RESTORE: ${{ steps.restore.outcome }}
           FORMAT: ${{ steps.format.outcome }}
           BUILD: ${{ steps.build.outcome }}
           WARNINGS: ${{ steps.warnings.outputs.count }}
           TESTS: ${{ steps.tests.outcome }}
-          HAS_TESTS: ${{ steps.structure.outputs.has_tests }}
-          FUNCTIONAL: ${{ steps.functional.outcome }}
         run: |
           python3 - <<'PY'
-          import os
           import json
+          import os
           import sys
           from pathlib import Path
 
-          env = os.environ
-
-          def read_json(name):
-              path = Path("proyecto") / name
-              if not path.exists():
-                  return {}
+          e = os.environ
+          def status(key):
+              return {'success': 'APROBADO', 'failure': 'FALLIDO', 'skipped': 'NO EJECUTADO'}.get(e.get(key), 'NO EVALUADO')
+          def read(filename):
+              path = Path('proyecto') / filename
               try:
-                  return json.loads(path.read_text())
-              except Exception:
+                  return json.loads(path.read_text(encoding='utf-8')) if path.is_file() else {}
+              except (OSError, ValueError):
                   return {}
 
-          config = read_json(".qa-config.json")
-          generic = read_json(".qa-generic.json")
-          functional = read_json(".qa-functional.json")
+          config = read('.qa-config.json')
+          evidence = read('.qa-inspection.json')
+          failing = []
+          if e.get('CHECKOUT') != 'success':
+              failing.append('Descarga: acceso al repositorio o token incorrecto')
+          if e.get('STRUCTURE') != 'success':
+              failing.append('N1-01: estructura no validada')
+          if e.get('INSPECTION') != 'success':
+              failing.append('Inspeccion estatica no completada')
 
-          execution = env["EXEC_MODE"]
-          qa_mode = env["QA_MODE"]
-          mode = config.get("mode", "")
-          profile = config.get("profile", "")
-
-          def label(value):
-              return {
-                  "success": "APROBADO",
-                  "failure": "FALLIDO",
-                  "skipped": "NO EJECUTADO"
-              }.get(value, "NO EVALUADO")
-
-          failed = (
-              env["CHECKOUT"] != "success"
-              or env["STRUCTURE"] != "success"
-          )
-
-          rows = []
-          rows.append(("N1-01", "Estructura", label(env["STRUCTURE"])))
-
-          if execution == "build_test":
-              for key in ["RESTORE", "FORMAT", "BUILD"]:
-                  if env[key] != "success":
-                      failed = True
-
-              if env["HAS_TESTS"] == "true":
-                  test_status = label(env["TESTS"])
-                  if env["TESTS"] != "success":
-                      failed = True
-              else:
-                  test_status = "SIN PRUEBAS"
-                  if qa_mode == "strict":
-                      failed = True
-
+          rows = [('N1-01', 'Estructura', status('STRUCTURE'))]
+          if e['MODO_EJECUCION'] == 'build_test':
+              if e.get('KIND') != 'dotnet' or e.get('HAS_TARGET') != 'true':
+                  failing.append('Sin solucion/proyecto unico para ejecutar build_test')
+              for key, label in [('RESTORE', 'N1-02'), ('FORMAT', 'N1-03'), ('BUILD', 'N1-04')]:
+                  if e.get(key) != 'success':
+                      failing.append(f'{label}: {status(key)}')
+              if e.get('HAS_TESTS') == 'true' and e.get('TESTS') != 'success':
+                  failing.append(f'N1-06: {status("TESTS")}')
+              if e['POLITICA_QA'] == 'strict' and e.get('HAS_TESTS') != 'true':
+                  failing.append('N1-06: sin pruebas en modo strict')
               rows += [
-                  ("N1-02", "Dependencias", label(env["RESTORE"])),
-                  ("N1-03", "Formato", label(env["FORMAT"])),
-                  ("N1-04", "Compilacion", label(env["BUILD"])),
-                  ("N1-05", "Advertencias",
-                   env["WARNINGS"] or "NO EVALUADO"),
-                  ("N1-06", "Pruebas automaticas", test_status)
+                  ('N1-02', 'Dependencias', status('RESTORE')),
+                  ('N1-03', 'Formato', status('FORMAT')),
+                  ('N1-04', 'Compilacion', status('BUILD')),
+                  ('N1-05', 'Advertencias', e.get('WARNINGS') or 'NO EVALUADO'),
+                  ('N1-06', 'Tests existentes', status('TESTS') if e.get('HAS_TESTS') == 'true' else 'SIN PRUEBAS')
               ]
           else:
-              for code, name in [
-                  ("N1-02", "Dependencias"),
-                  ("N1-03", "Formato"),
-                  ("N1-04", "Compilacion"),
-                  ("N1-05", "Advertencias"),
-                  ("N1-06", "Pruebas automaticas")
-              ]:
-                  rows.append((code, name, "NO EJECUTADO"))
+              rows += [(code, name, 'NO EJECUTADO') for code, name in [
+                  ('N1-02', 'Dependencias'), ('N1-03', 'Formato'),
+                  ('N1-04', 'Compilacion'), ('N1-05', 'Advertencias'),
+                  ('N1-06', 'Tests existentes')]]
 
-          names = {
-              "N1-07": "Health Check",
-              "N1-08": "Flujo positivo",
-              "N1-09": "Acceso",
-              "N1-10": "Manejo de errores",
-              "N1-11": "Aislamiento externo"
-          }
+          for code, label in [('N1-07', 'Health Check'), ('N1-08', 'Flujo positivo'),
+                              ('N1-09', 'Acceso'), ('N1-10', 'Manejo de errores'),
+                              ('N1-11', 'Aislamiento externo')]:
+              rows.append((code, label, evidence.get(code, {}).get('estado', 'NO EVALUADO')))
 
-          func_complete = True
-
-          for code, name in names.items():
-              static = generic.get(code, {})
-              actual = functional.get(code, {})
-              result = actual.get("status") or static.get(
-                  "status", "NO EVALUADO"
-              )
-
-              if result == "FALLIDO":
-                  failed = True
-              if result not in ("APROBADO", "NO APLICA"):
-                  func_complete = False
-
-              rows.append((code, name, result))
-
-          if failed:
-              global_status = "FALLIDO"
-          elif execution == "inspection":
-              global_status = "INSPECCION COMPLETADA"
+          if failing:
+              overall = 'FALLIDO'
+          elif e['MODO_EJECUCION'] == 'inspection':
+              overall = 'INSPECCION COMPLETADA'
           else:
-              global_status = "APROBADO TECNICO"
-
-          if qa_mode == "strict" and not func_complete:
-              failed = True
-              global_status = "FALLIDO - COBERTURA INCOMPLETA"
-
-          rows.append(("N1-12", "Resultado global", global_status))
-
+              overall = 'APROBADO TECNICO'
+          rows.append(('N1-12', 'Resultado global', overall))
           lines = [
-              "## QA Nivel 1 - Reporte",
-              "",
-              f"**Repositorio:** {env['REPO']}",
-              f"**Modo:** {qa_mode}",
-              f"**Ejecucion:** {execution}",
-              f"**Tipo:** {mode or 'NO IDENTIFICADO'}",
-              f"**Perfil:** {profile or 'NO IDENTIFICADO'}",
-              "",
-              "| ID | Control | Resultado |",
-              "|---|---|---|"
+              '## QA Nivel 1 - Reporte', '',
+              f'**Repositorio:** `{e["REPO_OBJETIVO"]}`',
+              f'**Ejecucion:** {e["MODO_EJECUCION"]}',
+              f'**Politica:** {e["POLITICA_QA"]}',
+              f'**Tipo:** {config.get("kind", "NO IDENTIFICADO")}',
+              f'**Perfil:** {config.get("profile", "NO IDENTIFICADO")}', '',
+              '| ID | Control | Resultado |', '|---|---|---|'
           ]
-
-          for code, name, status in rows:
-              lines.append(f"| {code} | {name} | {status} |")
-
-          lines += [
-              "",
-              "### Interpretacion",
-              "",
-              "- EVIDENCIA ESTATICA: se encontro un patron "
-              "relacionado, pero no se comprobo el comportamiento.",
-              "- SIN EVIDENCIA: no se encontro un patron reconocido; "
-              "no demuestra ausencia de la funcionalidad.",
-              "- NO EJECUTADO: se omitio el control por la modalidad.",
-              "- NO APLICA: el perfil no requiere ese control.",
-              "",
-              "**Certificacion funcional:** " +
-              ("CONTROLES COMPROBADOS" if func_complete and not failed
-               else "INCOMPLETA"),
-              "",
-              "El resultado tecnico no equivale a una "
-              "certificacion funcional completa."
-          ]
-
-          if failed:
-              lines.extend([
-                  "",
-                  "### Controles que requieren atencion",
-                  ""
-              ])
-              for code, name, state in rows:
-                  if "FALLIDO" in state:
-                      lines.append(f"- {code}: {name} ({state})")
-
-          with open(env["GITHUB_STEP_SUMMARY"], "a") as f:
-              f.write("\n".join(lines) + "\n")
-
-          print("Resultado global:", global_status)
-
-          if failed:
+          lines += [f'| {code} | {label} | {result} |' for code, label, result in rows]
+          lines += ['', '**Certificacion funcional:** INCOMPLETA',
+                    '', 'La evidencia estatica no certifica comportamiento funcional.',
+                    'INSPECCION COMPLETADA no equivale a compilacion o pruebas aprobadas.']
+          if failing:
+              lines += ['', '### Motivos de fallo']
+              lines += [f'- {item}' for item in failing]
+          lines += ['', '### Evidencias detectadas (primeras ubicaciones)']
+          for code, item in evidence.items():
+              lines.append(f'**{code}:** {item.get("coincidencias", 0)} coincidencias')
+              for match in item.get('ubicaciones', [])[:5]:
+                  lines.append(f'- `{match["archivo"]}:{match["linea"]}`')
+          with open(e['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write('\n'.join(lines) + '\n')
+          print('Resultado:', overall)
+          if failing:
               sys.exit(1)
           PY
