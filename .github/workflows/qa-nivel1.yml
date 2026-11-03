@@ -5,26 +5,25 @@ on:
   workflow_dispatch:
     inputs:
       repository:
-        description: "Repositorio a evaluar (usuario/repositorio)"
+        description: "Repositorio (usuario/repositorio)"
         required: true
         type: string
       solution_path:
-        description: "Ruta de la solucion .sln/.slnx (opcional)"
+        description: "Solucion .sln/.slnx (opcional)"
         required: false
         type: string
       project_path:
-        description: "Ruta del proyecto principal .csproj (opcional)"
+        description: "Proyecto principal (opcional)"
         required: false
         type: string
       tests_path:
-        description: "Ruta del proyecto de pruebas .csproj (opcional)"
+        description: "Proyecto de pruebas (opcional)"
         required: false
         type: string
 
   workflow_call:
     inputs:
       repository:
-        description: "Repositorio objetivo"
         required: false
         type: string
         default: ""
@@ -40,6 +39,7 @@ on:
         required: false
         type: string
         default: ""
+
     secrets:
       QA_REPO_READ_TOKEN:
         required: false
@@ -49,23 +49,23 @@ permissions:
 
 jobs:
   qa-nivel1:
-    name: QA Nivel 1 - Estructura
+    name: QA Nivel 1 - Validaciones
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
 
     steps:
       - name: Validar repositorio objetivo
         shell: bash
         env:
-          TARGET_REPO: ${{ inputs.repository || github.repository }}
+          TARGET: ${{ inputs.repository || github.repository }}
         run: |
-          if [[ ! "$TARGET_REPO" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]; then
-            echo "::error::Usa el formato usuario/repositorio"
+          if [[ ! "$TARGET" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]; then
+            echo "::error::Formato usuario/repositorio requerido"
             exit 1
           fi
-          echo "Repositorio objetivo: $TARGET_REPO"
 
-      - name: N1 - Obtener codigo del proyecto
-        uses: actions/checkout@v7
+      - name: Descargar proyecto
+        uses: actions/checkout@v4
         with:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ github.event_name == 'workflow_call' && github.sha || '' }}
@@ -73,113 +73,258 @@ jobs:
           path: proyecto
           persist-credentials: false
 
+      - name: Instalar .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
       - name: N1-01 Validar estructura
+        id: structure
         shell: bash
         working-directory: proyecto
         env:
-          SOLUTION_PATH: ${{ inputs.solution_path }}
-          PROJECT_PATH: ${{ inputs.project_path }}
-          TESTS_PATH: ${{ inputs.tests_path }}
+          SOLUTION: ${{ inputs.solution_path }}
+          PROJECT: ${{ inputs.project_path }}
+          TESTS: ${{ inputs.tests_path }}
         run: |
           set -euo pipefail
 
-          echo "Iniciando N1-01: Validacion de estructura"
-
           fail() {
             echo "::error::$1"
-            echo "### N1-01 - FALLIDO" >> "$GITHUB_STEP_SUMMARY"
-            echo "$1" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           }
 
-          # Buscar archivos de solucion
           mapfile -t solutions < <(
             find . -type f \( -name '*.sln' -o -name '*.slnx' \) \
-              -not -path '*/obj/*' \
-              -not -path '*/bin/*' | sort
+              -not -path '*/obj/*' -not -path '*/bin/*' | sort
           )
 
-          # Buscar proyectos .NET
           mapfile -t projects < <(
             find . -type f -name '*.csproj' \
-              -not -path '*/obj/*' \
-              -not -path '*/bin/*' | sort
+              -not -path '*/obj/*' -not -path '*/bin/*' | sort
           )
 
-          # Validar solucion
-          if [[ -n "$SOLUTION_PATH" ]]; then
-            [[ -f "$SOLUTION_PATH" ]] || fail "No existe la solucion indicada"
-            solution="$SOLUTION_PATH"
-          elif [[ ${#solutions[@]} -eq 1 ]]; then
-            solution="${solutions[0]}"
-          else
-            fail "Se esperaba una solucion. Encontradas: ${#solutions[@]}. Especifica solution_path."
+          if [[ -z "$SOLUTION" ]]; then
+            [[ ${#solutions[@]} -eq 1 ]] || \
+              fail "No existe una solucion unica"
+            SOLUTION="${solutions[0]}"
           fi
 
-          # Identificar proyectos de pruebas
-          test_candidates=()
+          [[ -f "$SOLUTION" ]] || fail "Solucion inexistente"
+
           main_candidates=()
+          test_candidates=()
 
           for file in "${projects[@]}"; do
-            filename="$(basename "$file")"
-
-            if [[ "$filename" =~ [Tt]ests?\.csproj$ ]] || \
+            if [[ "$file" =~ [Tt]ests?\.csproj$ ]] || \
                grep -Eiq \
-               'IsTestProject|Microsoft.NET.Test.Sdk|xunit|NUnit|MSTest' \
-               "$file"; then
+                 'IsTestProject|Microsoft.NET.Test.Sdk|xunit|NUnit|MSTest' \
+                 "$file"; then
               test_candidates+=("$file")
             else
               main_candidates+=("$file")
             fi
           done
 
-          # Validar proyecto principal
-          if [[ -n "$PROJECT_PATH" ]]; then
-            [[ -f "$PROJECT_PATH" ]] || fail "No existe el proyecto principal"
-            main_project="$PROJECT_PATH"
-          elif [[ ${#main_candidates[@]} -eq 1 ]]; then
-            main_project="${main_candidates[0]}"
-          else
-            fail "No se pudo identificar un proyecto principal unico. Especifica project_path."
+          if [[ -z "$PROJECT" ]]; then
+            [[ ${#main_candidates[@]} -eq 1 ]] || \
+              fail "Especifica project_path"
+            PROJECT="${main_candidates[0]}"
           fi
 
-          # Validar proyecto de pruebas
-          if [[ -n "$TESTS_PATH" ]]; then
-            [[ -f "$TESTS_PATH" ]] || fail "No existe el proyecto de pruebas"
-            test_project="$TESTS_PATH"
-          elif [[ ${#test_candidates[@]} -eq 1 ]]; then
-            test_project="${test_candidates[0]}"
-          else
-            fail "No se pudo identificar un proyecto de pruebas unico. Especifica tests_path."
+          if [[ -z "$TESTS" ]]; then
+            [[ ${#test_candidates[@]} -eq 1 ]] || \
+              fail "Especifica tests_path"
+            TESTS="${test_candidates[0]}"
           fi
 
-          # Verificar extensiones y archivos distintos
-          [[ "$solution" == *.sln || "$solution" == *.slnx ]] || fail "Extension de solucion invalida"
-          [[ "$main_project" == *.csproj ]] || fail "Proyecto principal invalido"
-          [[ "$test_project" == *.csproj ]] || fail "Proyecto de pruebas invalido"
+          [[ -f "$PROJECT" ]] || fail "Proyecto principal inexistente"
+          [[ -f "$TESTS" ]] || fail "Proyecto de pruebas inexistente"
+          [[ "$PROJECT" != "$TESTS" ]] || fail "Proyectos duplicados"
 
-          main_real="$(realpath "$main_project")"
-          test_real="$(realpath "$test_project")"
+          echo "solution=$SOLUTION" >> "$GITHUB_OUTPUT"
+          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+          echo "tests=$TESTS" >> "$GITHUB_OUTPUT"
 
-          [[ "$main_real" != "$test_real" ]] || fail "El proyecto principal y el de pruebas deben ser distintos"
+          echo "N1-01 APROBADO"
+          echo "Solucion: $SOLUTION"
+          echo "Principal: $PROJECT"
+          echo "Pruebas: $TESTS"
 
-          echo "Solucion: $solution"
-          echo "Proyecto principal: $main_project"
-          echo "Proyecto de pruebas: $test_project"
+      - name: N1-02 Restaurar dependencias
+        id: restore
+        if: steps.structure.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        working-directory: proyecto
+        env:
+          SOLUTION: ${{ steps.structure.outputs.solution }}
+        run: |
+          set -euo pipefail
+          dotnet restore "$SOLUTION" \
+            --verbosity minimal
+
+      - name: N1-03 Validar formato
+        id: format
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        working-directory: proyecto
+        env:
+          SOLUTION: ${{ steps.structure.outputs.solution }}
+        run: |
+          set -euo pipefail
+          dotnet format "$SOLUTION" \
+            --verify-no-changes \
+            --no-restore \
+            --verbosity normal
+
+      - name: N1-04 Compilar solucion
+        id: build
+        if: steps.restore.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        working-directory: proyecto
+        env:
+          SOLUTION: ${{ steps.structure.outputs.solution }}
+        run: |
+          set -euo pipefail
+          dotnet build "$SOLUTION" \
+            --configuration Release \
+            --no-restore \
+            --verbosity normal 2>&1 | tee build.log
+
+      - name: N1-05 Registrar advertencias
+        id: warnings
+        if: always() && steps.build.outcome != 'skipped'
+        shell: bash
+        working-directory: proyecto
+        run: |
+          if [[ ! -f build.log ]]; then
+            echo "No existe log de compilacion"
+            exit 0
+          fi
+
+          count=$(grep -Eic \
+            ':[[:space:]]warning[[:space:]]' build.log || true)
+
+          echo "Advertencias detectadas en log: $count"
+          echo "warning_count=$count" >> "$GITHUB_OUTPUT"
+
+          # N1-05 es informativo, no bloqueante.
+
+      - name: N1-06 Ejecutar pruebas
+        id: tests
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        working-directory: proyecto
+        env:
+          TESTS: ${{ steps.structure.outputs.tests }}
+        run: |
+          set -euo pipefail
+
+          dotnet test "$TESTS" \
+            --configuration Release \
+            --no-restore \
+            --logger "trx;LogFileName=qa-results.trx" \
+            --results-directory ./TestResults
+
+          python3 - <<'PY'
+          import glob
+          import sys
+          import xml.etree.ElementTree as ET
+
+          files = glob.glob("TestResults/**/*.trx", recursive=True)
+
+          if not files:
+              print("ERROR: no se genero archivo TRX")
+              sys.exit(1)
+
+          total = 0
+          failed = 0
+
+          for file in files:
+              root = ET.parse(file).getroot()
+              counters = root.find(".//{*}Counters")
+
+              if counters is None:
+                  continue
+
+              total += int(counters.attrib.get("total", 0))
+              failed += int(counters.attrib.get("failed", 0))
+
+          print(f"Pruebas detectadas: {total}")
+          print(f"Pruebas fallidas: {failed}")
+
+          if total == 0 or failed > 0:
+              sys.exit(1)
+          PY
+
+      - name: Guardar evidencias
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidencias-qa-nivel1
+          path: |
+            proyecto/build.log
+            proyecto/TestResults/**/*.trx
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: N1-12 Resumen de resultados
+        if: always()
+        shell: bash
+        env:
+          STRUCTURE: ${{ steps.structure.outcome }}
+          RESTORE: ${{ steps.restore.outcome }}
+          FORMAT: ${{ steps.format.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+          WARNINGS: ${{ steps.warnings.outputs.warning_count }}
+          TESTS: ${{ steps.tests.outcome }}
+        run: |
+          set -euo pipefail
+
+          status() {
+            case "$1" in
+              success) echo "APROBADO" ;;
+              failure) echo "FALLIDO" ;;
+              skipped) echo "NO EJECUTADO" ;;
+              *) echo "NO EVALUADO" ;;
+            esac
+          }
 
           {
-            echo "## QA Nivel 1 - Resultados"
+            echo "## QA Nivel 1 - Reporte"
             echo ""
-            echo "| ID | Prueba | Estado |"
+            echo "| ID | Control | Estado |"
             echo "|---|---|---|"
-            echo "| N1-01 | Estructura | APROBADO |"
-            echo "| N1-02 a N1-11 | Controles adicionales | PENDIENTES |"
-            echo "| N1-12 | Resultado global | NO EVALUADO |"
+            echo "| N1-01 | Estructura | $(status "$STRUCTURE") |"
+            echo "| N1-02 | Dependencias | $(status "$RESTORE") |"
+            echo "| N1-03 | Formato | $(status "$FORMAT") |"
+            echo "| N1-04 | Compilacion | $(status "$BUILD") |"
+            echo "| N1-05 | Advertencias | ${WARNINGS:-No evaluadas} |"
+            echo "| N1-06 | Pruebas automaticas | $(status "$TESTS") |"
+            echo "| N1-07 | Health Check | PENDIENTE |"
+            echo "| N1-08 | Flujo positivo | PENDIENTE |"
+            echo "| N1-09 | Acceso | PENDIENTE |"
+            echo "| N1-10 | Manejo de errores | PENDIENTE |"
+            echo "| N1-11 | Aislamiento externo | PENDIENTE |"
+            echo "| N1-12 | Resultado global | INCOMPLETO |"
             echo ""
-            echo "### Archivos detectados"
-            echo "- Solucion: \`$solution\`"
-            echo "- Proyecto principal: \`$main_project\`"
-            echo "- Proyecto de pruebas: \`$test_project\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "N1-01: APROBADO"
+          if [[ "$STRUCTURE" != "success" ||
+                "$RESTORE" != "success" ||
+                "$FORMAT" != "success" ||
+                "$BUILD" != "success" ||
+                "$TESTS" != "success" ]]; then
+            echo "::error::Fallo uno o mas controles obligatorios"
+            exit 1
+          fi
+
+          echo "Controles tecnicos aprobados."
+          echo "La certificacion QA global sigue pendiente."
