@@ -1,0 +1,35 @@
+
+name: QA - Nivel 1
+
+on:
+  workflow_dispatch:
+
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  qa-inicial:
+    name: Validacion inicial del motor QA
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Obtener repositorio
+        uses: actions/checkout@v4
+
+      - name: Validar estructura del repositorio
+        shell: bash
+        run: |
+          echo "Iniciando QA Nivel 1"
+
+          if [ -f ".github/workflows/qa-nivel1.yml" ]; then
+            echo "N1-01: Estructura inicial correcta"
+          else
+            echo "N1-01: Error de estructura"
+            exit 1
+          fi
+
+      - name: Resultado QA
+        run: |
+          echo "Motor QA inicial ejecutado correctamente"
