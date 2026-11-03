@@ -9,15 +9,15 @@ on:
         required: true
         type: string
       solution_path:
-        description: "Solucion .sln/.slnx (opcional)"
+        description: "Solucion (opcional)"
         required: false
         type: string
       project_path:
-        description: "Proyecto principal .csproj (opcional)"
+        description: "Proyecto principal (opcional)"
         required: false
         type: string
       tests_path:
-        description: "Proyecto de pruebas .csproj (opcional)"
+        description: "Proyecto de pruebas (opcional)"
         required: false
         type: string
       qa_mode:
@@ -32,24 +32,24 @@ on:
   workflow_call:
     inputs:
       repository:
-        required: false
         type: string
+        required: false
         default: ""
       solution_path:
-        required: false
         type: string
+        required: false
         default: ""
       project_path:
-        required: false
         type: string
+        required: false
         default: ""
       tests_path:
-        required: false
         type: string
+        required: false
         default: ""
       qa_mode:
-        required: false
         type: string
+        required: false
         default: baseline
     secrets:
       QA_REPO_READ_TOKEN:
@@ -60,7 +60,7 @@ permissions:
 
 jobs:
   qa-nivel1:
-    name: QA Nivel 1 - Validaciones
+    name: QA Nivel 1 - Analisis General
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -78,11 +78,13 @@ jobs:
             exit 1
           fi
 
-          if [[ "$QA_MODE" != "baseline" &&
-                "$QA_MODE" != "strict" ]]; then
+          if [[ "$QA_MODE" != "baseline" && "$QA_MODE" != "strict" ]]; then
             echo "::error::Modo QA invalido"
             exit 1
           fi
+
+          echo "Repositorio: $TARGET"
+          echo "Modo: $QA_MODE"
 
       - name: Descargar repositorio
         uses: actions/checkout@v7
@@ -101,7 +103,7 @@ jobs:
             9.0.x
             10.0.x
 
-      - name: N1-01 Validar estructura
+      - name: N1-01 Detectar estructura
         id: structure
         shell: bash
         working-directory: proyecto
@@ -110,148 +112,229 @@ jobs:
           PROJECT: ${{ inputs.project_path }}
           TESTS: ${{ inputs.tests_path }}
         run: |
-          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          import json
+          import sys
+          from pathlib import Path
 
-          fail() {
-            echo "::error::$1"
-            exit 1
+          ignored = {
+              ".git", "bin", "obj", "node_modules",
+              ".vs", ".idea", "packages"
           }
 
-          mapfile -t solutions < <(
-            find . -type f \
-              \( -name '*.sln' -o -name '*.slnx' \) \
-              -not -path '*/obj/*' \
-              -not -path '*/bin/*' | sort
+          def files(suffixes):
+              return sorted(
+                  str(p)
+                  for p in Path(".").rglob("*")
+                  if p.is_file()
+                  and p.suffix.lower() in suffixes
+                  and not any(x in ignored for x in p.parts)
+              )
+
+          def fail(message):
+              print(f"::error::{message}")
+              sys.exit(1)
+
+          def valid_file(value, suffixes):
+              p = Path(value)
+              if not p.is_file() or p.suffix.lower() not in suffixes:
+                  fail(f"Ruta inexistente o invalida: {value}")
+              return str(p)
+
+          solutions = files({".sln", ".slnx"})
+          projects = files({".csproj"})
+          sources = files({".cs"})
+
+          solution = os.environ.get("SOLUTION", "").strip()
+          project = os.environ.get("PROJECT", "").strip()
+          tests_input = os.environ.get("TESTS", "").strip()
+
+          if solution:
+              solution = valid_file(solution, {".sln", ".slnx"})
+          elif len(solutions) == 1:
+              solution = solutions[0]
+          elif len(solutions) > 1:
+              fail("Hay varias soluciones. Indica solution_path.")
+
+          test_projects = []
+
+          for p in projects:
+              text = Path(p).read_text(
+                  encoding="utf-8", errors="replace"
+              )
+
+              name_test = re.search(
+                  r"(tests?|specs?)\.csproj$",
+                  Path(p).name,
+                  re.IGNORECASE
+              )
+
+              package_test = re.search(
+                  r"IsTestProject|Microsoft\.NET\.Test\.Sdk|"
+                  r"xunit|NUnit|MSTest",
+                  text,
+                  re.IGNORECASE
+              )
+
+              if name_test or package_test:
+                  test_projects.append(p)
+
+          if tests_input:
+              selected = valid_file(tests_input, {".csproj"})
+              if selected not in test_projects:
+                  test_projects.append(selected)
+
+          test_projects = sorted(set(test_projects))
+
+          main_projects = [
+              p for p in projects if p not in test_projects
+          ]
+
+          if project:
+              project = valid_file(project, {".csproj"})
+          elif len(main_projects) == 1:
+              project = main_projects[0]
+          elif not solution and len(main_projects) > 1:
+              fail("Hay varios proyectos principales. Indica project_path.")
+
+          if projects:
+              mode = "dotnet"
+              target = solution or project
+
+              if not target:
+                  fail("No se pudo seleccionar solucion o proyecto")
+          elif sources:
+              mode = "source"
+              target = ""
+          else:
+              fail("No se encontraron archivos C# o proyectos .NET")
+
+          config = {
+              "mode": mode,
+              "target": target,
+              "solution": solution,
+              "project": project,
+              "tests": test_projects,
+              "source_count": len(sources),
+              "project_count": len(projects)
+          }
+
+          Path(".qa-config.json").write_text(
+              json.dumps(config, indent=2),
+              encoding="utf-8"
           )
 
-          mapfile -t projects < <(
-            find . -type f -name '*.csproj' \
-              -not -path '*/obj/*' \
-              -not -path '*/bin/*' | sort
-          )
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"mode={mode}\n")
+              f.write(f"has_tests={str(bool(test_projects)).lower()}\n")
 
-          if [[ -z "$SOLUTION" ]]; then
-            [[ ${#solutions[@]} -eq 1 ]] || \
-              fail "Indica solution_path: solucion no unica"
-            SOLUTION="${solutions[0]}"
-          fi
-
-          [[ -f "$SOLUTION" ]] || \
-            fail "No existe la solucion"
-
-          main_candidates=()
-          test_candidates=()
-
-          for file in "${projects[@]}"; do
-            if [[ "$file" =~ [Tt]ests?\.csproj$ ]] || \
-               grep -Eiq \
-               'IsTestProject|Microsoft.NET.Test.Sdk|xunit|NUnit|MSTest' \
-               "$file"; then
-              test_candidates+=("$file")
-            else
-              main_candidates+=("$file")
-            fi
-          done
-
-          if [[ -z "$PROJECT" ]]; then
-            [[ ${#main_candidates[@]} -eq 1 ]] || \
-              fail "Indica project_path: proyecto no unico"
-            PROJECT="${main_candidates[0]}"
-          fi
-
-          [[ -f "$PROJECT" ]] || \
-            fail "Proyecto principal inexistente"
-
-          HAS_TESTS=false
-          TEST_STATUS="SIN_PRUEBAS"
-
-          if [[ -n "$TESTS" ]]; then
-            [[ -f "$TESTS" ]] || \
-              fail "Proyecto de pruebas indicado inexistente"
-            HAS_TESTS=true
-            TEST_STATUS="DETECTADO"
-          elif [[ ${#test_candidates[@]} -eq 1 ]]; then
-            TESTS="${test_candidates[0]}"
-            HAS_TESTS=true
-            TEST_STATUS="DETECTADO"
-          elif [[ ${#test_candidates[@]} -gt 1 ]]; then
-            TEST_STATUS="AMBIGUO"
-            echo "::warning::Varios proyectos de pruebas. Indica tests_path"
-          fi
-
-          if [[ "$HAS_TESTS" == "true" &&
-                "$PROJECT" == "$TESTS" ]]; then
-            fail "Proyecto principal y pruebas son iguales"
-          fi
-
-          {
-            echo "solution=$SOLUTION"
-            echo "project=$PROJECT"
-            echo "tests=$TESTS"
-            echo "has_tests=$HAS_TESTS"
-            echo "test_status=$TEST_STATUS"
-          } >> "$GITHUB_OUTPUT"
-
-          echo "N1-01 APROBADO"
-          echo "Solucion: $SOLUTION"
-          echo "Proyecto: $PROJECT"
-          echo "Estado pruebas: $TEST_STATUS"
+          print("N1-01 APROBADO")
+          print("Modo:", mode)
+          print("Objetivo:", target or "Archivos C#")
+          print("Proyectos:", len(projects))
+          print("Archivos C#:", len(sources))
+          print("Proyectos de pruebas:", len(test_projects))
+          PY
 
       - name: N1-02 Restaurar dependencias
         id: restore
-        if: steps.structure.outcome == 'success'
+        if: >-
+          steps.structure.outcome == 'success' &&
+          steps.structure.outputs.mode == 'dotnet'
         continue-on-error: true
-        shell: bash
         working-directory: proyecto
-        env:
-          SOLUTION: ${{ steps.structure.outputs.solution }}
+        shell: bash
         run: |
           set -euo pipefail
-          dotnet restore "$SOLUTION" \
-            --verbosity minimal
 
-      - name: N1-03 Validar formato
+          target=$(python3 -c \
+            'import json; print(json.load(open(".qa-config.json"))["target"])')
+
+          dotnet restore "$target" --verbosity minimal
+
+      - name: N1-03 Verificar formato
         id: format
-        if: steps.restore.outcome == 'success'
+        if: >-
+          steps.structure.outcome == 'success' &&
+          (steps.restore.outcome == 'success' ||
+           steps.structure.outputs.mode == 'source')
         continue-on-error: true
-        shell: bash
         working-directory: proyecto
-        env:
-          SOLUTION: ${{ steps.structure.outputs.solution }}
+        shell: bash
         run: |
           set -euo pipefail
-          dotnet format "$SOLUTION" \
-            --verify-no-changes \
-            --no-restore
+
+          mode=$(python3 -c \
+            'import json; print(json.load(open(".qa-config.json"))["mode"])')
+
+          if [[ "$mode" == "dotnet" ]]; then
+            target=$(python3 -c \
+              'import json; print(json.load(open(".qa-config.json"))["target"])')
+
+            dotnet format "$target" \
+              --verify-no-changes \
+              --no-restore
+          else
+            python3 - <<'PY'
+          import sys
+          from pathlib import Path
+
+          errors = []
+
+          for path in Path(".").rglob("*.cs"):
+              if any(x in {"bin", "obj", ".git"} for x in path.parts):
+                  continue
+
+              for n, line in enumerate(
+                  path.read_text(
+                      encoding="utf-8",
+                      errors="replace"
+                  ).splitlines(), 1
+              ):
+                  if line.rstrip() != line:
+                      errors.append(f"{path}:{n}: espacios finales")
+
+          for error in errors[:100]:
+              print(error)
+
+          if errors:
+              sys.exit(1)
+
+          print("Verificacion basica de espacios: APROBADA")
+          PY
+          fi
 
       - name: N1-04 Compilar
         id: build
         if: steps.restore.outcome == 'success'
         continue-on-error: true
-        shell: bash
         working-directory: proyecto
-        env:
-          SOLUTION: ${{ steps.structure.outputs.solution }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          dotnet build "$SOLUTION" \
+          target=$(python3 -c \
+            'import json; print(json.load(open(".qa-config.json"))["target"])')
+
+          dotnet build "$target" \
             --configuration Release \
             --no-restore \
             --verbosity normal 2>&1 | tee build.log
 
-      - name: N1-05 Registrar advertencias
+      - name: N1-05 Contar advertencias
         id: warnings
         if: always() && steps.build.outcome == 'success'
-        shell: bash
         working-directory: proyecto
+        shell: bash
         run: |
           count=$(grep -Eic \
             ':[[:space:]]warning[[:space:]]' \
             build.log || true)
 
           echo "warning_count=$count" >> "$GITHUB_OUTPUT"
-          echo "Advertencias encontradas: $count"
+          echo "Coincidencias de advertencias: $count"
 
       - name: N1-06 Ejecutar pruebas disponibles
         id: tests
@@ -259,54 +342,78 @@ jobs:
           steps.build.outcome == 'success' &&
           steps.structure.outputs.has_tests == 'true'
         continue-on-error: true
-        shell: bash
         working-directory: proyecto
-        env:
-          TESTS: ${{ steps.structure.outputs.tests }}
+        shell: bash
         run: |
-          set -euo pipefail
-
-          dotnet test "$TESTS" \
-            --configuration Release \
-            --no-restore \
-            --logger "trx;LogFileName=qa-results.trx" \
-            --results-directory ./TestResults
-
           python3 - <<'PY'
-          import glob
+          import json
+          import subprocess
           import sys
           import xml.etree.ElementTree as ET
+          from pathlib import Path
 
-          files = glob.glob(
-              "TestResults/**/*.trx",
-              recursive=True
+          config = json.loads(
+              Path(".qa-config.json").read_text()
           )
 
-          if not files:
-              print("ERROR: sin resultados TRX")
-              sys.exit(1)
+          results = Path("TestResults")
+          results.mkdir(exist_ok=True)
 
-          total = 0
-          failed = 0
-          executed = 0
+          failed = False
+          total_executed = 0
 
-          for file in files:
-              root = ET.parse(file).getroot()
-              counters = root.find(".//{*}Counters")
+          for index, project in enumerate(config["tests"], 1):
+              print(f"Ejecutando: {project}", flush=True)
 
-              if counters is None:
+              directory = results / f"test_{index}"
+              directory.mkdir(exist_ok=True)
+
+              command = [
+                  "dotnet", "test", project,
+                  "--configuration", "Release",
+                  "--logger", "trx;LogFileName=results.trx",
+                  "--results-directory", str(directory)
+              ]
+
+              result = subprocess.run(command, check=False)
+
+              if result.returncode != 0:
+                  failed = True
+
+              trx_files = list(directory.glob("*.trx"))
+
+              if not trx_files:
+                  print(f"Sin resultados TRX: {project}")
+                  failed = True
                   continue
 
-              total += int(counters.get("total", 0))
-              failed += int(counters.get("failed", 0))
-              executed += int(counters.get("executed", 0))
+              for trx in trx_files:
+                  root = ET.parse(trx).getroot()
+                  counters = root.find(".//{*}Counters")
 
-          print(f"Total: {total}")
-          print(f"Ejecutadas: {executed}")
-          print(f"Fallidas: {failed}")
+                  if counters is None:
+                      failed = True
+                      continue
 
-          if executed == 0 or failed > 0:
+                  executed = int(counters.get("executed", "0"))
+                  errors = int(counters.get("failed", "0"))
+
+                  total_executed += executed
+
+                  print(
+                      f"Ejecutadas: {executed}, "
+                      f"Fallidas: {errors}"
+                  )
+
+                  if errors:
+                      failed = True
+
+          print("Total ejecutadas:", total_executed)
+
+          if failed or total_executed == 0:
               sys.exit(1)
+
+          print("N1-06 APROBADO")
           PY
 
       - name: Guardar evidencias
@@ -317,90 +424,115 @@ jobs:
           path: |
             proyecto/build.log
             proyecto/TestResults/**/*.trx
+            proyecto/.qa-config.json
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: N1-12 Consolidar resultados
+      - name: N1-12 Reporte QA
         if: always()
         shell: bash
         env:
           STRUCTURE: ${{ steps.structure.outcome }}
+          MODE: ${{ steps.structure.outputs.mode }}
           RESTORE: ${{ steps.restore.outcome }}
           FORMAT: ${{ steps.format.outcome }}
           BUILD: ${{ steps.build.outcome }}
           WARNINGS: ${{ steps.warnings.outputs.warning_count }}
+          HAS_TESTS: ${{ steps.structure.outputs.has_tests }}
           TESTS: ${{ steps.tests.outcome }}
-          TEST_STATUS: ${{ steps.structure.outputs.test_status }}
           QA_MODE: ${{ inputs.qa_mode || 'baseline' }}
         run: |
-          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import sys
 
-          status() {
-            case "$1" in
-              success) echo "APROBADO" ;;
-              failure) echo "FALLIDO" ;;
-              skipped) echo "NO EJECUTADO" ;;
-              *) echo "NO EVALUADO" ;;
-            esac
-          }
+          env = os.environ
 
-          n106="$(status "$TESTS")"
+          def result(name):
+              value = env.get(name, "")
+              return {
+                  "success": "APROBADO",
+                  "failure": "FALLIDO",
+                  "skipped": "NO EJECUTADO"
+              }.get(value, "NO EVALUADO")
 
-          if [[ "$TEST_STATUS" == "SIN_PRUEBAS" ]]; then
-            n106="SIN PRUEBAS DISPONIBLES"
-          elif [[ "$TEST_STATUS" == "AMBIGUO" ]]; then
-            n106="REQUIERE CONFIGURACION"
-          fi
+          mode = env.get("MODE", "")
+          qa_mode = env.get("QA_MODE", "baseline")
+          has_tests = env.get("HAS_TESTS") == "true"
 
-          global="APROBADO TECNICO"
-          failure=false
+          failed = False
+          partial = False
 
-          for result in "$STRUCTURE" "$RESTORE" \
-                        "$FORMAT" "$BUILD"; do
-            if [[ "$result" != "success" ]]; then
-              failure=true
-            fi
-          done
+          for key in ["STRUCTURE", "FORMAT"]:
+              if env.get(key) != "success":
+                  failed = True
 
-          if [[ "$TESTS" == "failure" ]]; then
-            failure=true
-          fi
+          if mode == "dotnet":
+              for key in ["RESTORE", "BUILD"]:
+                  if env.get(key) != "success":
+                      failed = True
+          else:
+              partial = True
 
-          if [[ "$QA_MODE" == "strict" &&
-                "$TESTS" != "success" ]]; then
-            failure=true
-          fi
+          if has_tests:
+              test_result = result("TESTS")
+              if env.get("TESTS") != "success":
+                  failed = True
+          else:
+              test_result = "SIN PRUEBAS"
+              if qa_mode == "strict":
+                  failed = True
 
-          if [[ "$failure" == "true" ]]; then
-            global="FALLIDO"
-          fi
+          if failed:
+              global_result = "FALLIDO"
+          elif partial:
+              global_result = "PARCIAL - SIN COMPILACION"
+          else:
+              global_result = "APROBADO TECNICO"
 
-          {
-            echo "## QA Nivel 1 - Reporte"
-            echo ""
-            echo "**Modo:** $QA_MODE"
-            echo ""
-            echo "| ID | Control | Resultado |"
-            echo "|---|---|---|"
-            echo "| N1-01 | Estructura | $(status "$STRUCTURE") |"
-            echo "| N1-02 | Dependencias | $(status "$RESTORE") |"
-            echo "| N1-03 | Formato | $(status "$FORMAT") |"
-            echo "| N1-04 | Compilacion | $(status "$BUILD") |"
-            echo "| N1-05 | Advertencias | ${WARNINGS:-NO EVALUADO} |"
-            echo "| N1-06 | Pruebas automaticas | $n106 |"
-            echo "| N1-07 | Health Check | PENDIENTE |"
-            echo "| N1-08 | Flujo positivo | PENDIENTE |"
-            echo "| N1-09 | Acceso | PENDIENTE |"
-            echo "| N1-10 | Manejo de errores | PENDIENTE |"
-            echo "| N1-11 | Aislamiento externo | PENDIENTE |"
-            echo "| N1-12 | Resultado tecnico | $global |"
-            echo ""
-            echo "**Certificacion funcional completa:** PENDIENTE"
-          } >> "$GITHUB_STEP_SUMMARY"
+          rows = [
+              ("N1-01", "Estructura", result("STRUCTURE")),
+              ("N1-02", "Dependencias",
+               result("RESTORE") if mode == "dotnet" else "NO EVALUABLE"),
+              ("N1-03", "Formato", result("FORMAT")),
+              ("N1-04", "Compilacion",
+               result("BUILD") if mode == "dotnet" else "NO EVALUABLE"),
+              ("N1-05", "Advertencias",
+               env.get("WARNINGS") or "NO EVALUADO"),
+              ("N1-06", "Pruebas automaticas", test_result),
+              ("N1-07", "Health Check", "PENDIENTE"),
+              ("N1-08", "Flujo positivo", "PENDIENTE"),
+              ("N1-09", "Acceso", "PENDIENTE"),
+              ("N1-10", "Manejo de errores", "PENDIENTE"),
+              ("N1-11", "Aislamiento externo", "PENDIENTE"),
+              ("N1-12", "Resultado tecnico", global_result)
+          ]
 
-          if [[ "$failure" == "true" ]]; then
-            echo "::error::Controles obligatorios fallidos"
-            exit 1
-          fi
+          lines = [
+              "## QA Nivel 1 - Reporte",
+              "",
+              f"**Modo QA:** {qa_mode}",
+              f"**Tipo detectado:** {mode or 'NO IDENTIFICADO'}",
+              "",
+              "| ID | Control | Resultado |",
+              "|---|---|---|"
+          ]
 
-          echo "QA tecnico aprobado en modo $QA_MODE"
+          for row in rows:
+              lines.append("| " + " | ".join(row) + " |")
+
+          lines.extend([
+              "",
+              "**Certificacion funcional completa:** PENDIENTE",
+              "",
+              "Los controles N1-07 a N1-11 no se han ejecutado."
+          ])
+
+          with open(env["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("\n".join(lines) + "\n")
+
+          print("Resultado:", global_result)
+
+          if failed:
+              sys.exit(1)
+          PY
