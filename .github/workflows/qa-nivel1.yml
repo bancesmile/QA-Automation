@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       repository:
-        description: "Repositorio (usuario/repositorio)"
+        description: "Repositorio usuario/repositorio"
         required: true
         type: string
       solution_path:
@@ -13,13 +13,21 @@ on:
         required: false
         type: string
       project_path:
-        description: "Proyecto principal (opcional)"
+        description: "Proyecto principal .csproj (opcional)"
         required: false
         type: string
       tests_path:
-        description: "Proyecto de pruebas (opcional)"
+        description: "Proyecto de pruebas .csproj (opcional)"
         required: false
         type: string
+      qa_mode:
+        description: "Nivel de exigencia"
+        required: true
+        type: choice
+        default: baseline
+        options:
+          - baseline
+          - strict
 
   workflow_call:
     inputs:
@@ -39,7 +47,10 @@ on:
         required: false
         type: string
         default: ""
-
+      qa_mode:
+        required: false
+        type: string
+        default: baseline
     secrets:
       QA_REPO_READ_TOKEN:
         required: false
@@ -54,18 +65,27 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Validar repositorio objetivo
+      - name: Validar parametros
         shell: bash
         env:
           TARGET: ${{ inputs.repository || github.repository }}
+          QA_MODE: ${{ inputs.qa_mode || 'baseline' }}
         run: |
+          set -euo pipefail
+
           if [[ ! "$TARGET" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]; then
-            echo "::error::Formato usuario/repositorio requerido"
+            echo "::error::Usa usuario/repositorio"
             exit 1
           fi
 
-      - name: Descargar proyecto
-        uses: actions/checkout@v4
+          if [[ "$QA_MODE" != "baseline" &&
+                "$QA_MODE" != "strict" ]]; then
+            echo "::error::Modo QA invalido"
+            exit 1
+          fi
+
+      - name: Descargar repositorio
+        uses: actions/checkout@v7
         with:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ github.event_name == 'workflow_call' && github.sha || '' }}
@@ -74,7 +94,7 @@ jobs:
           persist-credentials: false
 
       - name: Instalar .NET SDK
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: |
             8.0.x
@@ -98,22 +118,26 @@ jobs:
           }
 
           mapfile -t solutions < <(
-            find . -type f \( -name '*.sln' -o -name '*.slnx' \) \
-              -not -path '*/obj/*' -not -path '*/bin/*' | sort
+            find . -type f \
+              \( -name '*.sln' -o -name '*.slnx' \) \
+              -not -path '*/obj/*' \
+              -not -path '*/bin/*' | sort
           )
 
           mapfile -t projects < <(
             find . -type f -name '*.csproj' \
-              -not -path '*/obj/*' -not -path '*/bin/*' | sort
+              -not -path '*/obj/*' \
+              -not -path '*/bin/*' | sort
           )
 
           if [[ -z "$SOLUTION" ]]; then
             [[ ${#solutions[@]} -eq 1 ]] || \
-              fail "No existe una solucion unica"
+              fail "Indica solution_path: solucion no unica"
             SOLUTION="${solutions[0]}"
           fi
 
-          [[ -f "$SOLUTION" ]] || fail "Solucion inexistente"
+          [[ -f "$SOLUTION" ]] || \
+            fail "No existe la solucion"
 
           main_candidates=()
           test_candidates=()
@@ -121,8 +145,8 @@ jobs:
           for file in "${projects[@]}"; do
             if [[ "$file" =~ [Tt]ests?\.csproj$ ]] || \
                grep -Eiq \
-                 'IsTestProject|Microsoft.NET.Test.Sdk|xunit|NUnit|MSTest' \
-                 "$file"; then
+               'IsTestProject|Microsoft.NET.Test.Sdk|xunit|NUnit|MSTest' \
+               "$file"; then
               test_candidates+=("$file")
             else
               main_candidates+=("$file")
@@ -131,28 +155,47 @@ jobs:
 
           if [[ -z "$PROJECT" ]]; then
             [[ ${#main_candidates[@]} -eq 1 ]] || \
-              fail "Especifica project_path"
+              fail "Indica project_path: proyecto no unico"
             PROJECT="${main_candidates[0]}"
           fi
 
-          if [[ -z "$TESTS" ]]; then
-            [[ ${#test_candidates[@]} -eq 1 ]] || \
-              fail "Especifica tests_path"
+          [[ -f "$PROJECT" ]] || \
+            fail "Proyecto principal inexistente"
+
+          HAS_TESTS=false
+          TEST_STATUS="SIN_PRUEBAS"
+
+          if [[ -n "$TESTS" ]]; then
+            [[ -f "$TESTS" ]] || \
+              fail "Proyecto de pruebas indicado inexistente"
+            HAS_TESTS=true
+            TEST_STATUS="DETECTADO"
+          elif [[ ${#test_candidates[@]} -eq 1 ]]; then
             TESTS="${test_candidates[0]}"
+            HAS_TESTS=true
+            TEST_STATUS="DETECTADO"
+          elif [[ ${#test_candidates[@]} -gt 1 ]]; then
+            TEST_STATUS="AMBIGUO"
+            echo "::warning::Varios proyectos de pruebas. Indica tests_path"
           fi
 
-          [[ -f "$PROJECT" ]] || fail "Proyecto principal inexistente"
-          [[ -f "$TESTS" ]] || fail "Proyecto de pruebas inexistente"
-          [[ "$PROJECT" != "$TESTS" ]] || fail "Proyectos duplicados"
+          if [[ "$HAS_TESTS" == "true" &&
+                "$PROJECT" == "$TESTS" ]]; then
+            fail "Proyecto principal y pruebas son iguales"
+          fi
 
-          echo "solution=$SOLUTION" >> "$GITHUB_OUTPUT"
-          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
-          echo "tests=$TESTS" >> "$GITHUB_OUTPUT"
+          {
+            echo "solution=$SOLUTION"
+            echo "project=$PROJECT"
+            echo "tests=$TESTS"
+            echo "has_tests=$HAS_TESTS"
+            echo "test_status=$TEST_STATUS"
+          } >> "$GITHUB_OUTPUT"
 
           echo "N1-01 APROBADO"
           echo "Solucion: $SOLUTION"
-          echo "Principal: $PROJECT"
-          echo "Pruebas: $TESTS"
+          echo "Proyecto: $PROJECT"
+          echo "Estado pruebas: $TEST_STATUS"
 
       - name: N1-02 Restaurar dependencias
         id: restore
@@ -179,10 +222,9 @@ jobs:
           set -euo pipefail
           dotnet format "$SOLUTION" \
             --verify-no-changes \
-            --no-restore \
-            --verbosity normal
+            --no-restore
 
-      - name: N1-04 Compilar solucion
+      - name: N1-04 Compilar
         id: build
         if: steps.restore.outcome == 'success'
         continue-on-error: true
@@ -192,6 +234,7 @@ jobs:
           SOLUTION: ${{ steps.structure.outputs.solution }}
         run: |
           set -euo pipefail
+
           dotnet build "$SOLUTION" \
             --configuration Release \
             --no-restore \
@@ -199,26 +242,22 @@ jobs:
 
       - name: N1-05 Registrar advertencias
         id: warnings
-        if: always() && steps.build.outcome != 'skipped'
+        if: always() && steps.build.outcome == 'success'
         shell: bash
         working-directory: proyecto
         run: |
-          if [[ ! -f build.log ]]; then
-            echo "No existe log de compilacion"
-            exit 0
-          fi
-
           count=$(grep -Eic \
-            ':[[:space:]]warning[[:space:]]' build.log || true)
+            ':[[:space:]]warning[[:space:]]' \
+            build.log || true)
 
-          echo "Advertencias detectadas en log: $count"
           echo "warning_count=$count" >> "$GITHUB_OUTPUT"
+          echo "Advertencias encontradas: $count"
 
-          # N1-05 es informativo, no bloqueante.
-
-      - name: N1-06 Ejecutar pruebas
+      - name: N1-06 Ejecutar pruebas disponibles
         id: tests
-        if: steps.build.outcome == 'success'
+        if: >-
+          steps.build.outcome == 'success' &&
+          steps.structure.outputs.has_tests == 'true'
         continue-on-error: true
         shell: bash
         working-directory: proyecto
@@ -238,14 +277,18 @@ jobs:
           import sys
           import xml.etree.ElementTree as ET
 
-          files = glob.glob("TestResults/**/*.trx", recursive=True)
+          files = glob.glob(
+              "TestResults/**/*.trx",
+              recursive=True
+          )
 
           if not files:
-              print("ERROR: no se genero archivo TRX")
+              print("ERROR: sin resultados TRX")
               sys.exit(1)
 
           total = 0
           failed = 0
+          executed = 0
 
           for file in files:
               root = ET.parse(file).getroot()
@@ -254,19 +297,21 @@ jobs:
               if counters is None:
                   continue
 
-              total += int(counters.attrib.get("total", 0))
-              failed += int(counters.attrib.get("failed", 0))
+              total += int(counters.get("total", 0))
+              failed += int(counters.get("failed", 0))
+              executed += int(counters.get("executed", 0))
 
-          print(f"Pruebas detectadas: {total}")
-          print(f"Pruebas fallidas: {failed}")
+          print(f"Total: {total}")
+          print(f"Ejecutadas: {executed}")
+          print(f"Fallidas: {failed}")
 
-          if total == 0 or failed > 0:
+          if executed == 0 or failed > 0:
               sys.exit(1)
           PY
 
       - name: Guardar evidencias
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: evidencias-qa-nivel1
           path: |
@@ -275,7 +320,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: N1-12 Resumen de resultados
+      - name: N1-12 Consolidar resultados
         if: always()
         shell: bash
         env:
@@ -285,6 +330,8 @@ jobs:
           BUILD: ${{ steps.build.outcome }}
           WARNINGS: ${{ steps.warnings.outputs.warning_count }}
           TESTS: ${{ steps.tests.outcome }}
+          TEST_STATUS: ${{ steps.structure.outputs.test_status }}
+          QA_MODE: ${{ inputs.qa_mode || 'baseline' }}
         run: |
           set -euo pipefail
 
@@ -297,34 +344,63 @@ jobs:
             esac
           }
 
+          n106="$(status "$TESTS")"
+
+          if [[ "$TEST_STATUS" == "SIN_PRUEBAS" ]]; then
+            n106="SIN PRUEBAS DISPONIBLES"
+          elif [[ "$TEST_STATUS" == "AMBIGUO" ]]; then
+            n106="REQUIERE CONFIGURACION"
+          fi
+
+          global="APROBADO TECNICO"
+          failure=false
+
+          for result in "$STRUCTURE" "$RESTORE" \
+                        "$FORMAT" "$BUILD"; do
+            if [[ "$result" != "success" ]]; then
+              failure=true
+            fi
+          done
+
+          if [[ "$TESTS" == "failure" ]]; then
+            failure=true
+          fi
+
+          if [[ "$QA_MODE" == "strict" &&
+                "$TESTS" != "success" ]]; then
+            failure=true
+          fi
+
+          if [[ "$failure" == "true" ]]; then
+            global="FALLIDO"
+          fi
+
           {
             echo "## QA Nivel 1 - Reporte"
             echo ""
-            echo "| ID | Control | Estado |"
+            echo "**Modo:** $QA_MODE"
+            echo ""
+            echo "| ID | Control | Resultado |"
             echo "|---|---|---|"
             echo "| N1-01 | Estructura | $(status "$STRUCTURE") |"
             echo "| N1-02 | Dependencias | $(status "$RESTORE") |"
             echo "| N1-03 | Formato | $(status "$FORMAT") |"
             echo "| N1-04 | Compilacion | $(status "$BUILD") |"
-            echo "| N1-05 | Advertencias | ${WARNINGS:-No evaluadas} |"
-            echo "| N1-06 | Pruebas automaticas | $(status "$TESTS") |"
+            echo "| N1-05 | Advertencias | ${WARNINGS:-NO EVALUADO} |"
+            echo "| N1-06 | Pruebas automaticas | $n106 |"
             echo "| N1-07 | Health Check | PENDIENTE |"
             echo "| N1-08 | Flujo positivo | PENDIENTE |"
             echo "| N1-09 | Acceso | PENDIENTE |"
             echo "| N1-10 | Manejo de errores | PENDIENTE |"
             echo "| N1-11 | Aislamiento externo | PENDIENTE |"
-            echo "| N1-12 | Resultado global | INCOMPLETO |"
+            echo "| N1-12 | Resultado tecnico | $global |"
             echo ""
+            echo "**Certificacion funcional completa:** PENDIENTE"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [[ "$STRUCTURE" != "success" ||
-                "$RESTORE" != "success" ||
-                "$FORMAT" != "success" ||
-                "$BUILD" != "success" ||
-                "$TESTS" != "success" ]]; then
-            echo "::error::Fallo uno o mas controles obligatorios"
+          if [[ "$failure" == "true" ]]; then
+            echo "::error::Controles obligatorios fallidos"
             exit 1
           fi
 
-          echo "Controles tecnicos aprobados."
-          echo "La certificacion QA global sigue pendiente."
+          echo "QA tecnico aprobado en modo $QA_MODE"
