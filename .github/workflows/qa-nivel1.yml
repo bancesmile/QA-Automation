@@ -1,1 +1,75 @@
+name: QA - 35 controles .NET y SAP
 
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Repositorio usuario/repositorio"
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      repository:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      QA_REPO_READ_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    name: Inspeccion estatica de 35 controles
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Descargar motor QA
+        uses: actions/checkout@v7
+        with:
+          repository: bancesmile/QA-Automation
+          path: motor
+          persist-credentials: false
+
+      - name: Validar identificador del repositorio
+        env:
+          TARGET: ${{ inputs.repository || github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$TARGET" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Usa el formato usuario/repositorio"
+            exit 1
+          fi
+
+      - name: Descargar proyecto a inspeccionar
+        id: target
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          token: ${{ secrets.QA_REPO_READ_TOKEN || github.token }}
+          path: proyecto
+          persist-credentials: false
+
+      - name: Inspeccionar codigo sin ejecutarlo
+        shell: bash
+        env:
+          TARGET: ${{ inputs.repository || github.repository }}
+        run: |
+          set -euo pipefail
+          python3 motor/scripts/qa_scan.py \
+            --root proyecto \
+            --repo "$TARGET" \
+            --output qa-results
+          cat qa-results/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar resultados
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: qa-35-controles
+          path: qa-results/
+          if-no-files-found: ignore
+          retention-days: 7
