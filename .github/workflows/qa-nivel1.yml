@@ -1,3 +1,4 @@
+
 name: QA - 35 controles .NET y SAP
 
 on:
@@ -7,9 +8,21 @@ on:
         description: "Repositorio usuario/repositorio"
         required: true
         type: string
+      branch:
+        description: "Rama del proyecto (vacio = predeterminada)"
+        required: false
+        type: string
+        default: ""
+
   workflow_call:
     inputs:
       repository:
+        description: "Repositorio objetivo (vacio = llamador)"
+        required: false
+        type: string
+        default: ""
+      branch:
+        description: "Rama o referencia del proyecto objetivo"
         required: false
         type: string
         default: ""
@@ -25,33 +38,67 @@ jobs:
     name: Inspeccion estatica de 35 controles
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    steps:
-      - name: Descargar motor QA
-        uses: actions/checkout@v7
-        with:
-          repository: bancesmile/QA-Automation
-          path: motor
-          persist-credentials: false
 
-      - name: Validar identificador del repositorio
+    steps:
+      - name: Validar parametros
+        shell: bash
         env:
           TARGET: ${{ inputs.repository || github.repository }}
-        shell: bash
+          TARGET_BRANCH: ${{ inputs.branch }}
         run: |
           set -euo pipefail
+
           if [[ ! "$TARGET" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
             echo "::error::Usa el formato usuario/repositorio"
             exit 1
           fi
+
+          if [[ "$TARGET_BRANCH" == *$'\n'* || "$TARGET_BRANCH" == *$'\r'* ]]; then
+            echo "::error::La rama contiene caracteres invalidos"
+            exit 1
+          fi
+
+          echo "Repositorio objetivo: $TARGET"
+          echo "Rama solicitada: ${TARGET_BRANCH:-predeterminada}"
+
+      - name: Descargar motor QA
+        uses: actions/checkout@v7
+        with:
+          repository: bancesmile/QA-Automation
+          ref: main
+          path: motor
+          persist-credentials: false
 
       - name: Descargar proyecto a inspeccionar
         id: target
         uses: actions/checkout@v7
         with:
           repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.branch || '' }}
           token: ${{ secrets.QA_REPO_READ_TOKEN || github.token }}
           path: proyecto
           persist-credentials: false
+          fetch-depth: 1
+
+      - name: Registrar referencia analizada
+        id: revision
+        shell: bash
+        env:
+          TARGET: ${{ inputs.repository || github.repository }}
+          TARGET_BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          sha="$(git -C proyecto rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Referencia del analisis"
+            echo ""
+            echo "- **Repositorio:** \`$TARGET\`"
+            echo "- **Rama solicitada:** \`${TARGET_BRANCH:-predeterminada}\`"
+            echo "- **Commit analizado:** \`$sha\`"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Inspeccionar codigo sin ejecutarlo
         shell: bash
